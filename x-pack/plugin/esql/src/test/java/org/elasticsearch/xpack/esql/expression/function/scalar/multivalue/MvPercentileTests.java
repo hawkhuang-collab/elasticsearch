@@ -455,8 +455,7 @@ public class MvPercentileTests extends AbstractScalarFunctionTestCase {
                     .doubleValue();
             }
 
-            // 1E-6 relative tolerance: RHEL-8 x87 FP accumulation can diverge ~1.71E-7 relative
-            return closeTo(expected, Math.abs(expected * 0.000001));
+            return closeTo(expected, Math.abs(expected * 0.0000001));
         }
 
         throw new IllegalArgumentException("Unsupported type: " + rawValues.get(0).getClass());
