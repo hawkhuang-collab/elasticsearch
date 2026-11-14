@@ -90,22 +90,6 @@ every nested object matches:
     - [e, false]
 
 ---
-the source loader gives the same answer:
-- do:
-    esql.query:
-      body:
-        query: FROM na_orders | EVAL cheap = NESTED_ALL(items.price > 10) | KEEP id, cheap | SORT id | LIMIT 10
-        pragma:
-          nested_loader: source
-- match:
-    values:
-    - [a, true]
-    - [b, false]
-    - [c, true]
-    - [d, true]
-    - [e, false]
-
----
 the filter is pushed to Lucene:
 - do:
     esql.query:

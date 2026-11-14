@@ -39,7 +39,11 @@ public interface SearchStats {
         return false;
     }
 
-    /** Whether every shard here that maps the nested child {@code field} can query it. At least one must map it. */
+    /**
+     * Whether every shard here that maps the nested child {@code field} can query it, and every shard that maps its nested
+     * object maps it too. At least one must map it. Where the object is mapped but the field is not, its children hold null
+     * for it in memory, which a query on the field cannot match the way a predicate on null would.
+     */
     default boolean nestedFieldIsSearchable(FieldName field) {
         return false;
     }

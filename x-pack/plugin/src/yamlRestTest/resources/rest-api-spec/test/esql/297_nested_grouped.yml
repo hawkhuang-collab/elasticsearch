@@ -1,7 +1,7 @@
 # NESTED(<aggregate> BY <child fields>) groups each parent's nested objects like STATS ... BY and returns one keyword
 # per parent holding a JSON object: one level per key, sorted by key, the aggregate at the bottom. Children with a null
 # key are left out; a parent without grouped children gets null. A multivalued key counts once per value, as in STATS.
-# Grouped reductions read doc values only, never _source.
+# Child values load like an ordinary field's, as for the other reductions.
 # Execute with -Desql.nested_reductions.test_execution=true. A capability skip is not a pass.
 ---
 setup:
@@ -219,14 +219,3 @@ grouping requires an aggregate:
 - contains:
     error.reason: "NESTED BY supports COUNT, SUM, MIN and MAX"
 
----
-grouped reductions never read _source:
-- do:
-    catch: bad_request
-    esql.query:
-      body:
-        query: FROM ng_orders | EVAL by_user = NESTED(COUNT(*) BY items.user) | KEEP by_user | LIMIT 10
-        pragma:
-          nested_loader: source
-- contains:
-    error.reason: "NESTED BY reads doc values only"

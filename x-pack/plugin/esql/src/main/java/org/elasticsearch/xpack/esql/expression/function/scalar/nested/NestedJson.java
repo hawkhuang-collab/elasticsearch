@@ -19,7 +19,7 @@ import java.util.List;
 
 /**
  * Returns a nested collection for display, since ES|QL has no column type for a list of objects. A {@link Nested}
- * marker, so it is resolved and lowered with the other nested scopes; it reads doc values, never {@code _source}.
+ * marker, so it is resolved and lowered with the other nested scopes, and reads child values the way they do.
  */
 public final class NestedJson extends Nested {
     public static final FunctionDefinition DEFINITION = FunctionDefinition.def(NestedJson.class).unary(NestedJson::new).name("nested_json");

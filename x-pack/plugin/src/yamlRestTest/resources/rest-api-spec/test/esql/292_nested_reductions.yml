@@ -4,8 +4,9 @@
 # Error substrings are proposed categories.
 # One wrapper produces one completed Boolean/scalar for every input row, including join/branch copies.
 # Confirmed choices: empty/all-null SUM = null; a selection tie may return either maximum-key candidate.
-# On a data node, child values come from doc values, like an ordinary field. A reduction reads _source instead
-# after a coordinator step, when a child field has no doc values, or with the nested_loader pragma set to source.
+# Child values load like an ordinary field's: from doc values, or from the child's object in the parent's _source when
+# the field has none. A reduction runs on the data nodes, so one after a command that runs on the coordinator is moved
+# before it when that keeps the result, and rejected otherwise.
 ---
 setup:
 - requires:
@@ -1727,8 +1728,8 @@ branch copies reduce separately:
     esql.query:
       allow_partial_results: false
       body:
-        query: FROM nr_orders | FORK (WHERE order_id == "a") (WHERE order_id == "a") | EVAL total = NESTED(SUM(items.price * items.quantity))
-          | KEEP order_id, total
+        query: FROM nr_orders | FORK (WHERE order_id == "a" | EVAL total = NESTED(SUM(items.price * items.quantity)))
+          (WHERE order_id == "a" | EVAL total = NESTED(SUM(items.price * items.quantity))) | KEEP order_id, total
     allowed_warnings_regex:
     - "No limit defined, adding default limit of \\[1000\\]"
 - match:
@@ -1749,7 +1750,8 @@ branch copies contribute twice to outer aggregation:
     esql.query:
       allow_partial_results: false
       body:
-        query: FROM nr_orders | FORK (WHERE order_id == "a") (WHERE order_id == "a") | EVAL total = NESTED(SUM(items.price * items.quantity))
+        query: FROM nr_orders | FORK (WHERE order_id == "a" | EVAL total = NESTED(SUM(items.price * items.quantity)))
+          (WHERE order_id == "a" | EVAL total = NESTED(SUM(items.price * items.quantity)))
           | STATS parents = COUNT(*), total = SUM(total), revenue = SUM(revenue)
     allowed_warnings_regex:
     - "No limit defined, adding default limit of \\[1000\\]"
@@ -1804,49 +1806,6 @@ a reduction on the data node reads doc values like an ordinary field:
 - match:
     values:
     - [2]
-# Only _index is loaded: every child field has doc values, so _source is not.
-- match: { values_loaded: 1 }
-
----
-the source loader pragma makes a reduction read source:
-- do:
-    indices.create:
-      index: nr_tags
-      body:
-        settings:
-          number_of_shards: 1
-          number_of_replicas: 0
-        mappings:
-          dynamic: strict
-          properties:
-            id:
-              type: keyword
-            items:
-              type: nested
-              properties:
-                tags:
-                  type: keyword
-- do:
-    bulk:
-      refresh: true
-      body:
-      - index:
-          _index: nr_tags
-          _id: x
-      - id: x
-        items:
-        - tags: [sale, new, sale]
-- do:
-    esql.query:
-      allow_partial_results: false
-      body:
-        query: FROM nr_tags | EVAL tags = NESTED(SUM(MV_COUNT(items.tags))) | KEEP tags | LIMIT 10
-        pragma:
-          nested_loader: source
-- match:
-    values:
-    - [3]
-- match: { values_loaded: 2 }
 
 ---
 a reduction after a sort and limit runs on the data node:
@@ -1888,7 +1847,7 @@ a reduction after a sort and limit runs on the data node:
     - [2]
 
 ---
-a reduction after a coordinator step reads source:
+a reduction after a coordinator limit moves to the data node:
 - do:
     indices.create:
       index: nr_tags
@@ -1921,9 +1880,24 @@ a reduction after a coordinator step reads source:
       allow_partial_results: false
       body:
         query: FROM nr_tags | LIMIT 1 | MV_EXPAND id | EVAL tags = NESTED(SUM(MV_COUNT(items.tags))) | KEEP tags
+# Keyword doc values are sorted and deduplicated, as for a top-level field.
 - match:
     values:
-    - [3]
+    - [2]
+
+---
+a reduction after a coordinator step is rejected:
+- do:
+    catch: bad_request
+    esql.query:
+      allow_partial_results: false
+      body:
+        query: FROM nr_orders | FORK (WHERE order_id == "a") (WHERE order_id == "b") | EVAL total = NESTED(SUM(items.price))
+          | KEEP total
+- match:
+    error.type: verification_exception
+- contains:
+    error.reason: NESTED(SUM(items.price)) must run on the data nodes, so it cannot follow [FORK
 
 ---
 a nested path conflict does not fail a reduction that does not read it:

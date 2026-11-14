@@ -36,7 +36,6 @@ import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.NestedExpandExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
-import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
 import org.elasticsearch.xpack.esql.querydsl.query.SingleValueQuery;
 import org.elasticsearch.xpack.esql.stats.SearchStats;
 
@@ -65,8 +64,7 @@ public final class PushNestedExpandFilterToSource extends PhysicalOptimizerRules
     LocalPhysicalOptimizerContext> {
     @Override
     protected PhysicalPlan rule(FilterExec filter, LocalPhysicalOptimizerContext context) {
-        if (context.configuration().pragmas().nestedLoader() != QueryPragmas.NestedLoader.INDEX
-            || filter.child() instanceof NestedExpandExec == false) {
+        if (filter.child() instanceof NestedExpandExec == false) {
             return filter;
         }
         NestedExpandExec expand = (NestedExpandExec) filter.child();

@@ -6,8 +6,8 @@
 # Parent columns repeat on every row. The child fields become ordinary columns named by their full path.
 # A parent with no objects (empty, null or missing) keeps one row whose child columns are null, as MV_EXPAND does.
 # The expansion runs on the data nodes, so it can't follow a command that runs on the coordinator, such as a LIMIT.
-# Child values come from doc values, like an ordinary field. The expansion reads _source instead when a child field has
-# no doc values. The nested_loader pragma (index by default, or source) can force _source.
+# Child values load like an ordinary field's: from doc values, or from the child's object in the parent's _source when
+# the field has none.
 ---
 setup:
 - requires:
@@ -509,49 +509,6 @@ expansion on the data node reads doc values like an ordinary field:
 - match:
     values:
     - [[new, sale]]
-# Only _index is loaded: every child field has doc values, so _source is not.
-- match: { values_loaded: 1 }
-
----
-the source loader pragma reads source order on the data node:
-- do:
-    indices.create:
-      index: ne_tags
-      body:
-        settings:
-          number_of_shards: 1
-          number_of_replicas: 0
-        mappings:
-          dynamic: strict
-          properties:
-            id:
-              type: keyword
-            items:
-              type: nested
-              properties:
-                tags:
-                  type: keyword
-- do:
-    bulk:
-      refresh: true
-      body:
-      - index:
-          _index: ne_tags
-          _id: x
-      - id: x
-        items:
-        - tags: [sale, new, sale]
-- do:
-    esql.query:
-      allow_partial_results: false
-      body:
-        query: FROM ne_tags | NESTED_EXPAND items | KEEP items.tags | LIMIT 10
-        pragma:
-          nested_loader: source
-- match:
-    values:
-    - [[sale, new, sale]]
-- match: { values_loaded: 2 }
 
 ---
 expansion after a limit without a sort is rejected:
@@ -567,7 +524,7 @@ expansion after a limit without a sort is rejected:
     error.reason: NESTED_EXPAND must run on the data nodes
 
 ---
-a child field without doc values makes the expansion read source:
+a child field without doc values reads the child's source:
 - do:
     indices.create:
       index: ne_text
@@ -603,9 +560,10 @@ a child field without doc values makes the expansion read source:
       allow_partial_results: false
       body:
         query: FROM ne_text | NESTED_EXPAND items | KEEP items.tags, items.note | LIMIT 10
+# The keyword still reads doc values, sorted and deduplicated, as an ordinary keyword does.
 - match:
     values:
-    - [[sale, new, sale], hello]
+    - [[new, sale], hello]
 
 ---
 ordinary keyword field cannot be expanded:
@@ -706,34 +664,6 @@ expansion needs the source rows:
     error.type: verification_exception
 - contains:
     error.reason: Unknown column [items]
-
----
-synthetic source is rejected when reading source:
-- do:
-    indices.create:
-      index: ne_synthetic
-      body:
-        settings:
-          index.mapping.source.mode: synthetic
-          number_of_shards: 1
-          number_of_replicas: 0
-        mappings:
-          properties:
-            items:
-              type: nested
-              properties:
-                price:
-                  type: long
-- do:
-    catch: bad_request
-    esql.query:
-      allow_partial_results: false
-      body:
-        query: FROM ne_synthetic | NESTED_EXPAND items | KEEP items.price | LIMIT 10
-        pragma:
-          nested_loader: source
-- contains:
-    error.reason: stored, unfiltered
 
 ---
 synthetic source expands doc values on the data node:

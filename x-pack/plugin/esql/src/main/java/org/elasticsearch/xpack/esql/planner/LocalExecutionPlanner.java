@@ -179,7 +179,6 @@ import org.elasticsearch.xpack.esql.expression.function.fulltext.FullTextFunctio
 import org.elasticsearch.xpack.esql.expression.function.grouping.Bucket;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedChildren;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedExpandOperator;
-import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedReduction;
 import org.elasticsearch.xpack.esql.expression.predicate.Predicates;
 import org.elasticsearch.xpack.esql.index.IndexProperties;
 import org.elasticsearch.xpack.esql.inference.InferenceService;
@@ -194,6 +193,7 @@ import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.Grok;
 import org.elasticsearch.xpack.esql.plan.logical.HighlightOptions;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.NestedExpand;
 import org.elasticsearch.xpack.esql.plan.logical.highlight.HighlightAnalyzers;
 import org.elasticsearch.xpack.esql.plan.logical.inference.DenseVector;
 import org.elasticsearch.xpack.esql.plan.physical.AggregateExec;
@@ -228,7 +228,6 @@ import org.elasticsearch.xpack.esql.plan.physical.MMRExec;
 import org.elasticsearch.xpack.esql.plan.physical.MetricsInfoExec;
 import org.elasticsearch.xpack.esql.plan.physical.MvExpandExec;
 import org.elasticsearch.xpack.esql.plan.physical.NestedExpandExec;
-import org.elasticsearch.xpack.esql.plan.physical.NestedReduceExec;
 import org.elasticsearch.xpack.esql.plan.physical.OutputExec;
 import org.elasticsearch.xpack.esql.plan.physical.PackDimsExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -1527,15 +1526,11 @@ public class LocalExecutionPlanner {
                 layout = outputLayout.build();
                 pendingAliases.clear();
             }
-            // Without shard contexts NESTED reductions read _source, as the nested_loader pragma may ask.
-            boolean nestedFromSource = eval instanceof NestedReduceExec
-                && context.queryPragmas().nestedLoader() != QueryPragmas.NestedLoader.INDEX
-                && field.child().anyMatch(NestedReduction.class::isInstance);
             var evaluatorSupplier = EvalMapper.toEvaluator(
                 context.foldCtx(),
                 field.child(),
                 layout,
-                nestedFromSource ? null : context.shardContexts,
+                context.shardContexts,
                 context.analysisRegistry()
             );
             outputLayout.append(field.toAttribute());
@@ -2883,32 +2878,15 @@ public class LocalExecutionPlanner {
         Layout.Builder layout = source.layout.builder();
         expand.expanded().forEach(layout::append);
         Attribute doc = expand.child().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElse(null);
-        var children = doc == null
-            || source.layout.get(doc.id()) == null
-            || context.queryPragmas().nestedLoader() != QueryPragmas.NestedLoader.INDEX
-                ? null
-                : NestedChildren.factory(
-                    context.shardContexts,
-                    expand.path(),
-                    expand.paths(),
-                    expand.expanded().stream().map(Attribute::dataType).toList()
-                );
-        // Only _index remains when every child field has doc values and _source was not loaded.
-        Attribute sourceMetadata = expand.metadata().size() > 1 ? expand.metadata().getFirst() : null;
+        List<DataType> types = expand.expanded().stream().map(Attribute::dataType).toList();
+        var children = NestedChildren.factory(context.shardContexts, expand.path(), expand.paths(), types);
+        if (doc == null || source.layout.get(doc.id()) == null || children == null) {
+            throw new IllegalStateException(
+                NestedExpand.commandName(expand.flatten()) + " reads the child documents of the parents' shards on this node"
+            );
+        }
         return source.with(
-            new NestedExpandOperator.Factory(
-                sourceMetadata == null ? -1 : source.layout.get(sourceMetadata.id()).channel(),
-                source.layout.get(expand.metadata().getLast().id()).channel(),
-                children == null ? -1 : source.layout.get(doc.id()).channel(),
-                children,
-                expand.path(),
-                expand.indices(),
-                expand.expanded().stream().map(Attribute::dataType).toList(),
-                expand.paths(),
-                expand.mappedIndices(),
-                expand.sourceFailures(),
-                expand.flatten()
-            ),
+            new NestedExpandOperator.Factory(source.layout.get(doc.id()).channel(), children, expand.path(), types, expand.flatten()),
             layout.build()
         );
     }

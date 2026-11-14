@@ -26,7 +26,6 @@ import org.elasticsearch.xpack.esql.expression.function.scalar.convert.Foldables
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedAll;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedAny;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedJson;
-import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedReductionsContractTests;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedStats;
 import org.elasticsearch.xpack.esql.parser.ParsingException;
 import org.elasticsearch.xpack.esql.session.Configuration;
@@ -273,14 +272,8 @@ public class EsqlFunctionRegistryTests extends ESTestCase {
                 || def.clazz() == NestedAny.class
                 || def.clazz() == NestedAll.class
                 || def.clazz() == NestedJson.class) {
-                // This syntax marker requires analyzer context and never executes/serializes unlowered.
-                assertTrue(
-                    Arrays.stream(NestedReductionsContractTests.class.getMethods())
-                        .anyMatch(
-                            method -> method.getDeclaringClass() == NestedReductionsContractTests.class
-                                && method.getName().startsWith("test")
-                        )
-                );
+                // These syntax markers need analyzer context and never execute or serialize unlowered. The nested YAML REST
+                // tests cover them.
                 continue;
             }
             checkFunctionTestExists(errors, def, "Tests", AbstractFunctionTestCase.class);

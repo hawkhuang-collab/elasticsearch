@@ -113,21 +113,6 @@ a nested predicate is pushed beside a parent filter:
 - match: { documents_found: 1 }
 
 ---
-the source loader pragma filters in memory:
-- do:
-    esql.query:
-      allow_partial_results: false
-      body:
-        query: FROM nr_push | WHERE NESTED_ANY(items.price > 10) | KEEP id | SORT id | LIMIT 10
-        pragma:
-          nested_loader: source
-- match:
-    values:
-    - [a]
-    - [d]
-- match: { documents_found: 4 }
-
----
 an untranslatable nested predicate filters in memory:
 - do:
     esql.query:

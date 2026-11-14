@@ -96,22 +96,6 @@ a collection with at least one object:
     - [e, true]
 
 ---
-the source loader sees the same objects:
-- do:
-    esql.query:
-      body:
-        query: FROM nc_orders | EVAL has_items = NESTED_ANY(items, true) | KEEP id, has_items | SORT id | LIMIT 10
-        pragma:
-          nested_loader: source
-- match:
-    values:
-    - [a, true]
-    - [b, false]
-    - [c, false]
-    - [d, true]
-    - [e, true]
-
----
 a non-empty collection filter is pushed to Lucene:
 - do:
     esql.query:
@@ -189,22 +173,6 @@ count the objects in a collection:
       type: keyword
     - name: n
       type: long
-- match:
-    values:
-    - [a, 2]
-    - [b, 0]
-    - [c, 0]
-    - [d, 1]
-    - [e, 1]
-
----
-the source loader counts the same objects:
-- do:
-    esql.query:
-      body:
-        query: FROM nc_orders | EVAL n = NESTED(items, COUNT(*)) | KEEP id, n | SORT id | LIMIT 10
-        pragma:
-          nested_loader: source
 - match:
     values:
     - [a, 2]

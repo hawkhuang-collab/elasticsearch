@@ -15,10 +15,8 @@ import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
-import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
-import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.expression.UnresolvedAttribute;
 import org.elasticsearch.xpack.esql.core.type.DataType;
@@ -59,8 +57,7 @@ import java.util.function.Function;
 
 /** Binds reductions before EVAL's aggregate verification; public outputs contain only completed parent values. */
 public final class NestedReductionsAnalysis {
-    private static final List<String> METADATA = List.of("_source", "_index");
-    /** Types NESTED_JSON can write and the source loader can convert. */
+    /** Types NESTED_JSON can write. */
     private static final Set<DataType> JSON_CHILD_TYPES = Set.of(
         DataType.BOOLEAN,
         DataType.INTEGER,
@@ -69,7 +66,7 @@ public final class NestedReductionsAnalysis {
         DataType.KEYWORD,
         DataType.TEXT
     );
-    /** Types the reductions and NESTED_EXPAND read; the source loader converts only {@link #JSON_CHILD_TYPES}. */
+    /** Types the reductions and NESTED_EXPAND read. */
     private static final Set<DataType> SUPPORTED_CHILD_TYPES = Set.of(
         DataType.BOOLEAN,
         DataType.INTEGER,
@@ -82,14 +79,6 @@ public final class NestedReductionsAnalysis {
     );
 
     private NestedReductionsAnalysis() {}
-
-    private static String privateMetadataName(String name) {
-        return Attribute.rawTemporaryName(NestedScopeField.NAMESPACE, "metadata", name);
-    }
-
-    private static boolean isPrivateMetadataName(String name) {
-        return METADATA.stream().anyMatch(role -> privateMetadataName(role).equals(name));
-    }
 
     /** A lookup attaches values to the FROM row; it does not replace that row's nested source. */
     private static List<EsRelation> primarySources(LogicalPlan input) {
@@ -147,22 +136,16 @@ public final class NestedReductionsAnalysis {
         if (first.path().equals(second.path()) == false || first.collection() != second.collection()) {
             throw error(nested, "NESTED cannot merge different nested paths for [" + left.name() + "] across branches");
         }
-        Set<String> indices = new HashSet<>(first.indices());
-        indices.addAll(second.indices());
-        Map<String, String> sourceFailures = new HashMap<>(first.sourceFailures());
-        sourceFailures.putAll(second.sourceFailures());
         DataType type = first.getDataType() == second.getDataType() ? first.getDataType() : DataType.UNSUPPORTED;
-        // These bindings are already flattened: each child has its own entry and per-index applicability.
-        // Retaining one branch's property tree would misrepresent children supplied only by another branch.
+        // These bindings are already flattened: each child has its own entry. Retaining one branch's property tree would
+        // misrepresent children supplied only by another branch.
         return left.withField(
             new NestedScopeField(
                 first.getName(),
                 type,
                 Map.of(),
                 first.path(),
-                indices,
                 first.collection(),
-                sourceFailures,
                 first.conflict() != null ? first.conflict() : second.conflict()
             )
         );
@@ -175,10 +158,9 @@ public final class NestedReductionsAnalysis {
             if (usesNested(plan)) {
                 plan.forEachExpressionDown(NamedExpression.class, expression -> {
                     if (expression.synthetic() == false
-                        && (isPrivateMetadataName(expression.name())
-                            || expression.name().startsWith(NestedScopeField.PREFIX)
+                        && (expression.name().startsWith(NestedScopeField.PREFIX)
                             || expression.name().equals(NestedScopeField.NAMESPACE))) {
-                        throw error(expression, "NESTED uses reserved internal metadata and schema names");
+                        throw error(expression, "NESTED uses reserved internal schema names");
                     }
                 });
             }
@@ -189,70 +171,10 @@ public final class NestedReductionsAnalysis {
     public static final class Prepare extends ParameterizedRule<LogicalPlan, LogicalPlan, AnalyzerContext> {
         @Override
         public LogicalPlan apply(LogicalPlan plan, AnalyzerContext context) {
-            Set<EsRelation> requiredSources = new HashSet<>();
-            plan.forEachDown(p -> {
-                if (p.children().isEmpty() == false
-                    && (p instanceof NestedExpand || p.expressions().stream().anyMatch(e -> e.anyMatch(Nested.class::isInstance)))) {
-                    requiredSources.addAll(primarySources(p.children().getFirst()));
-                }
-            });
-            if (requiredSources.isEmpty()) {
+            if (usesNested(plan) == false) {
                 return plan;
             }
-            Set<NameId> captured = new HashSet<>();
-            plan.forEachExpressionDown(NamedExpression.class, expression -> {
-                if (isPrivateMetadataName(expression.name())) {
-                    if (expression.synthetic() == false) {
-                        throw error(expression, "NESTED uses reserved internal metadata names");
-                    }
-                    if (expression instanceof Alias alias && alias.child() instanceof MetadataAttribute metadata) {
-                        captured.add(metadata.id());
-                    }
-                }
-            });
-            LogicalPlan prepared = plan.transformUp(EsRelation.class, relation -> {
-                if (requiredSources.contains(relation) == false) {
-                    return relation;
-                }
-                List<Attribute> output = new ArrayList<>(relation.output());
-                for (Attribute attribute : output) {
-                    if (attribute.synthetic() == false && isPrivateMetadataName(attribute.name())) {
-                        throw error(attribute, "NESTED uses reserved internal metadata names");
-                    }
-                }
-                List<Alias> aliases = new ArrayList<>();
-                for (String name : METADATA) {
-                    Attribute metadata = output.stream()
-                        .filter(a -> a instanceof MetadataAttribute && a.name().equals(name))
-                        .findFirst()
-                        .orElse(null);
-                    if (metadata == null) {
-                        metadata = new MetadataAttribute(
-                            relation.source(),
-                            name,
-                            name.equals("_source") ? DataType.SOURCE : DataType.KEYWORD,
-                            Nullability.TRUE,
-                            null,
-                            true,
-                            false
-                        );
-                        output.add(metadata);
-                    }
-                    if (captured.contains(metadata.id()) == false) {
-                        aliases.add(new Alias(relation.source(), privateMetadataName(name), metadata, null, true));
-                    }
-                }
-                EsRelation scan = output.equals(relation.output()) ? relation : relation.withAttributes(output);
-                if (aliases.isEmpty()) {
-                    return scan;
-                }
-                // Capture identity at the scan, before public EVAL/RENAME/DROP can replace the same metadata names.
-                // A projection aliases existing blocks without computing a public SOURCE-valued expression.
-                List<NamedExpression> projections = new ArrayList<>(output);
-                projections.addAll(aliases);
-                return new Project(relation.source(), scan, projections);
-            });
-            return prepared.transformUp(p -> {
+            return plan.transformUp(p -> {
                 if (p.children().isEmpty()) {
                     return p;
                 }
@@ -353,7 +275,7 @@ public final class NestedReductionsAnalysis {
                 if (lowered instanceof Project project) {
                     List<NamedExpression> projected = new ArrayList<>(project.projections());
                     for (Attribute a : project.child().output()) {
-                        if (carriedThroughProject(a) && project.outputSet().contains(a) == false) {
+                        if (isSchema(a) && project.outputSet().contains(a) == false) {
                             projected.add(a);
                         }
                     }
@@ -445,8 +367,6 @@ public final class NestedReductionsAnalysis {
         body.forEachDown(Attribute.class, a -> fields.putIfAbsent(a.id(), a));
         keys.forEach(key -> fields.putIfAbsent(((Attribute) key).id(), (Attribute) key));
         String path = collection;
-        Set<String> indices = new HashSet<>();
-        Map<String, String> sourceFailures = new HashMap<>();
         for (Attribute attr : fields.values()) {
             if (attr instanceof FieldAttribute f && f.field() instanceof NestedScopeField n) {
                 if (n.conflict() != null) {
@@ -459,27 +379,18 @@ public final class NestedReductionsAnalysis {
                     throw error(nested, name + " requires one nested path");
                 }
                 path = n.path();
-                indices.addAll(n.indices());
-                sourceFailures.putAll(n.sourceFailures());
             }
         }
         if (path == null) {
             throw error(nested, name + " requires a mapped nested field");
         }
         String scope = path;
-        if (roots.containsKey(path)) {
-            indices = new HashSet<>(roots.get(path).indices());
-            sourceFailures.putAll(roots.get(path).sourceFailures());
-        }
         if (roots.keySet().stream().anyMatch(parent -> scope.startsWith(parent + "."))) {
             throw error(nested, name + " supports one nesting level");
         }
-        if (indices.stream().anyMatch(index -> index.contains(":"))) {
-            throw error(nested, name + " cross-cluster loading is not supported by this PoC");
-        }
+        checkReadsIndexRows(input, nested, name);
         List<Attribute> channels = new ArrayList<>();
         List<String> paths = new ArrayList<>();
-        List<Set<String>> mapped = new ArrayList<>();
         Map<NameId, Attribute> replacement = new HashMap<>();
         for (Attribute attr : fields.values()) {
             if (attr instanceof FieldAttribute == false || ((FieldAttribute) attr).field() instanceof NestedScopeField == false) {
@@ -492,43 +403,32 @@ public final class NestedReductionsAnalysis {
             channels.add(ref);
             replacement.put(attr.id(), ref);
             paths.add(attr.name().substring(NestedScopeField.PREFIX.length() + path.length() + 1));
-            mapped.add(((NestedScopeField) ((FieldAttribute) attr).field()).indices());
         }
         Expression bound = body.transformUp(Attribute.class, a -> replacement.get(a.id()));
         List<Attribute> groupings = keys.stream().map(key -> replacement.get(((Attribute) key).id())).toList();
         if (bound instanceof Sum sum) {
             bound = sum.forTransportVersion(context.minimumVersion());
         }
-        return new NestedReduction(
-            nested.source(),
-            metadata(nested, input),
-            path,
-            indices,
-            bound,
-            groupings,
-            false,
-            nested instanceof NestedAll,
-            channels,
-            paths,
-            mapped,
-            sourceFailures
-        );
+        return new NestedReduction(nested.source(), path, bound, groupings, false, nested instanceof NestedAll, channels, paths);
     }
 
-    private static List<Expression> metadata(Nested nested, LogicalPlan input) {
-        List<Expression> metadata = new ArrayList<>();
-        for (String name : METADATA) {
-            Attribute found = input.output()
-                .stream()
-                .filter(a -> a.synthetic() && a.name().equals(privateMetadataName(name)))
-                .findFirst()
-                .orElse(null);
-            if (found == null) {
-                throw error(nested, nested.functionName() + " input is missing required source metadata [" + name + "]");
+    /**
+     * The nested functions read the child documents of each row's parent document, so the row must still be one. A STATS
+     * replaces the rows with groups, which have no child documents. A LOOKUP JOIN keeps the parent row of its left side.
+     */
+    private static void checkReadsIndexRows(LogicalPlan input, Expression at, String function) {
+        LogicalPlan plan = input;
+        while (plan instanceof EsRelation == false && plan.children().isEmpty() == false) {
+            if (plan instanceof Aggregate) {
+                throw error(at, function + " reads each row's nested documents, so it cannot follow [" + plan.sourceText() + "]");
             }
-            metadata.add(found);
+            plan = plan instanceof Join join ? join.left() : plan.children().getFirst();
         }
-        return metadata;
+        for (EsRelation relation : primarySources(input)) {
+            if (relation.concreteQualifiedIndices().stream().anyMatch(index -> index.contains(":"))) {
+                throw error(at, function + " cross-cluster loading is not supported by this PoC");
+            }
+        }
     }
 
     /**
@@ -557,9 +457,7 @@ public final class NestedReductionsAnalysis {
         if (schema.roots().keySet().stream().anyMatch(parent -> path.startsWith(parent + "."))) {
             throw error(json, "NESTED_JSON supports one nesting level");
         }
-        if (scope.indices().stream().anyMatch(index -> index.contains(":"))) {
-            throw error(json, "NESTED_JSON cross-cluster loading is not supported by this PoC");
-        }
+        checkReadsIndexRows(input, json, "NESTED_JSON");
         List<FieldAttribute> children = new ArrayList<>();
         for (FieldAttribute field : schema.fields().values()) {
             NestedScopeField child = (NestedScopeField) field.field();
@@ -576,26 +474,11 @@ public final class NestedReductionsAnalysis {
         children.sort(Comparator.comparing(NestedReductionsAnalysis::publicName));
         List<Attribute> channels = new ArrayList<>();
         List<String> paths = new ArrayList<>();
-        List<Set<String>> mapped = new ArrayList<>();
         for (FieldAttribute child : children) {
             channels.add(new ReferenceAttribute(child.source(), child.name(), child.dataType()));
             paths.add(publicName(child).substring(path.length() + 1));
-            mapped.add(((NestedScopeField) child.field()).indices());
         }
-        return new NestedReduction(
-            json.source(),
-            metadata(json, input),
-            path,
-            scope.indices(),
-            Literal.NULL,
-            List.of(),
-            true,
-            false,
-            channels,
-            paths,
-            mapped,
-            scope.sourceFailures()
-        );
+        return new NestedReduction(json.source(), path, Literal.NULL, List.of(), true, false, channels, paths);
     }
 
     /**
@@ -635,9 +518,7 @@ public final class NestedReductionsAnalysis {
         if (collections.stream().anyMatch(parent -> path.startsWith(parent + "."))) {
             throw error(target, command + " supports one nesting level");
         }
-        if (scope.indices().stream().anyMatch(index -> index.contains(":"))) {
-            throw error(target, command + " cross-cluster loading is not supported by this PoC");
-        }
+        checkReadsIndexRows(expand.child(), target, command);
         List<FieldAttribute> children = new ArrayList<>();
         for (Attribute attribute : input) {
             if (attribute instanceof FieldAttribute field
@@ -657,37 +538,12 @@ public final class NestedReductionsAnalysis {
         children.sort(Comparator.comparing(NestedReductionsAnalysis::publicName));
         List<Attribute> expanded = new ArrayList<>();
         List<String> paths = new ArrayList<>();
-        List<Set<String>> mapped = new ArrayList<>();
         for (FieldAttribute child : children) {
             String column = publicName(child);
             expanded.add(new ReferenceAttribute(expand.source(), column, child.dataType()));
             paths.add(column.substring(path.length() + 1));
-            mapped.add(((NestedScopeField) child.field()).indices());
         }
-        List<Attribute> metadata = new ArrayList<>();
-        for (String role : METADATA) {
-            Attribute found = input.stream()
-                .filter(a -> a.synthetic() && a.name().equals(privateMetadataName(role)))
-                .findFirst()
-                .orElse(null);
-            if (found == null) {
-                throw error(target, command + " input is missing required source metadata [" + role + "]");
-            }
-            metadata.add(found);
-        }
-        return new NestedExpand(
-            expand.source(),
-            expand.child(),
-            expand.flatten(),
-            null,
-            metadata,
-            path,
-            scope.indices(),
-            expanded,
-            paths,
-            mapped,
-            scope.sourceFailures()
-        );
+        return new NestedExpand(expand.source(), expand.child(), expand.flatten(), null, path, expanded, paths);
     }
 
     private static String publicName(FieldAttribute field) {
@@ -730,11 +586,6 @@ public final class NestedReductionsAnalysis {
                 return p;
             });
         }
-    }
-
-    /** Nested schema and the captured source aliases. The empty-output marker is synthetic and must stay where it is. */
-    private static boolean carriedThroughProject(Attribute attribute) {
-        return isSchema(attribute) || (attribute.synthetic() && isPrivateMetadataName(attribute.name()));
     }
 
     private static boolean isSchema(Expression a) {

@@ -1,6 +1,7 @@
 # NESTED_JSON(<collection>) returns each parent's nested objects as one keyword holding a JSON array, in document order.
-# Values come from doc values, never _source: within an object the keys are sorted, arrays are in doc-values order with
-# keyword duplicates removed, and missing or null fields are left out. An empty or missing collection gives null.
+# Values load like an ordinary field's, from doc values or, for a field without them, the child's object in the parent's
+# _source: within an object the keys are sorted, arrays are in doc-values order with keyword duplicates removed, and
+# missing or null fields are left out. An empty or missing collection gives null.
 # Execute with -Desql.nested_reductions.test_execution=true. A capability skip is not a pass.
 ---
 setup:
@@ -176,18 +177,6 @@ a replaced name cannot be expanded:
     error.reason: "NESTED_EXPAND cannot use [items]: a column of that name replaces it here"
 
 ---
-never reads _source:
-- do:
-    catch: bad_request
-    esql.query:
-      body:
-        query: FROM nj_orders | EVAL items = NESTED_JSON(items) | LIMIT 1
-        pragma:
-          nested_loader: source
-- contains:
-    error.reason: "NESTED_JSON reads doc values only"
-
----
 a child field without doc values:
 - do:
     indices.create:
@@ -207,12 +196,12 @@ a child field without doc values:
       refresh: true
       body: { items: [{ description: red shoes }] }
 - do:
-    catch: bad_request
     esql.query:
       body:
         query: FROM nj_text | EVAL items = NESTED_JSON(items) | LIMIT 1
-- contains:
-    error.reason: "NESTED_JSON reads doc values only"
+- match:
+    values:
+    - ['[{"description":"red shoes"}]']
 
 ---
 an unsupported child type:

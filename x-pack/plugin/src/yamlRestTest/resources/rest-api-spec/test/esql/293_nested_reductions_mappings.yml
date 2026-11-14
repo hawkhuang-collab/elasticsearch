@@ -1,0 +1,278 @@
+# Child fields read as ordinary fields of the same mapping would: from doc values, or from the child's object in the
+# parent's stored source when the field has none. Source mode and normalizers apply as they do to a top-level field.
+# Execute with -Desql.nested_reductions.test_execution=true. A capability skip is not a pass.
+---
+setup:
+- requires:
+    test_runner_features:
+    - capabilities
+    - contains
+    capabilities:
+    - method: POST
+      path: /_query
+      parameters: []
+      capabilities:
+      - nested_reductions
+    reason: "Completed per-parent nested reductions; capability stays unadvertised unless -Desql.nested_reductions.test_execution=true"
+
+---
+explicit coerce true matches a plain long sum:
+- do:
+    indices.create:
+      index: nr_coerce_default
+      body:
+        settings:
+          number_of_shards: 1
+          number_of_replicas: 0
+        mappings:
+          properties:
+            items:
+              type: nested
+              properties:
+                price:
+                  type: long
+                  coerce: true
+- do:
+    bulk:
+      refresh: true
+      body:
+      - index:
+          _index: nr_coerce_default
+          _id: "1"
+      - items:
+        - price: 10
+- do:
+    esql.query:
+      allow_partial_results: false
+      body:
+        query: FROM nr_coerce_default | EVAL total = NESTED(SUM(items.price)) | KEEP total | LIMIT 10
+- match: { columns.0.name: total }
+- match: { columns.0.type: long }
+- length: { values: 1 }
+- match: { values.0.0: 10 }
+
+---
+explicit ignore_malformed false matches a plain long sum:
+- do:
+    indices.create:
+      index: nr_ignore_malformed_default
+      body:
+        settings:
+          number_of_shards: 1
+          number_of_replicas: 0
+        mappings:
+          properties:
+            items:
+              type: nested
+              properties:
+                price:
+                  type: long
+                  ignore_malformed: false
+- do:
+    bulk:
+      refresh: true
+      body:
+      - index:
+          _index: nr_ignore_malformed_default
+          _id: "1"
+      - items:
+        - price: 10
+- do:
+    esql.query:
+      allow_partial_results: false
+      body:
+        query: FROM nr_ignore_malformed_default | EVAL total = NESTED(SUM(items.price)) | KEEP total | LIMIT 10
+- match: { columns.0.name: total }
+- match: { columns.0.type: long }
+- length: { values: 1 }
+- match: { values.0.0: 10 }
+
+---
+synthetic source reads doc values on the data node:
+- do:
+    indices.create:
+      index: nr_synthetic
+      body:
+        settings:
+          index.mapping.source.mode: synthetic
+          number_of_shards: 1
+          number_of_replicas: 0
+        mappings:
+          properties:
+            items:
+              type: nested
+              properties:
+                price:
+                  type: long
+- do:
+    bulk:
+      refresh: true
+      body:
+      - index:
+          _index: nr_synthetic
+          _id: "1"
+      - items:
+        - price: 10
+        - price: 20
+- do:
+    esql.query:
+      allow_partial_results: false
+      body:
+        query: FROM nr_synthetic | EVAL total = NESTED(SUM(items.price)) | KEEP total | LIMIT 10
+- match:
+    values:
+    - [30]
+
+---
+disabled source reads doc values on the data node:
+- do:
+    indices.create:
+      index: nr_disabled_source
+      body:
+        settings:
+          number_of_shards: 1
+          number_of_replicas: 0
+        mappings:
+          _source:
+            enabled: false
+          properties:
+            items:
+              type: nested
+              properties:
+                price:
+                  type: long
+- do:
+    bulk:
+      refresh: true
+      body:
+      - index:
+          _index: nr_disabled_source
+          _id: "1"
+      - items:
+        - price: 10
+        - price: 20
+- do:
+    esql.query:
+      allow_partial_results: false
+      body:
+        query: FROM nr_disabled_source | EVAL total = NESTED(SUM(items.price)) | KEEP total | LIMIT 10
+- match:
+    values:
+    - [30]
+
+---
+normalizer applies to doc values like an ordinary field:
+- do:
+    indices.create:
+      index: nr_normalizer
+      body:
+        settings:
+          number_of_shards: 1
+          number_of_replicas: 0
+          analysis:
+            normalizer:
+              lowercase_norm:
+                type: custom
+                filter:
+                - lowercase
+        mappings:
+          properties:
+            items:
+              type: nested
+              properties:
+                sku:
+                  type: keyword
+                  normalizer: lowercase_norm
+- do:
+    bulk:
+      refresh: true
+      body:
+      - index:
+          _index: nr_normalizer
+          _id: "1"
+      - items:
+        - sku: BOOK
+- do:
+    esql.query:
+      allow_partial_results: false
+      body:
+        query: FROM nr_normalizer | EVAL hit = NESTED_ANY(items.sku == "book") | KEEP hit | LIMIT 10
+- match:
+    values:
+    - [true]
+
+---
+synthetic source reads doc values after a coordinator limit and expansion:
+- do:
+    indices.create:
+      index: nr_synthetic
+      body:
+        settings:
+          index.mapping.source.mode: synthetic
+          number_of_shards: 1
+          number_of_replicas: 0
+        mappings:
+          properties:
+            id:
+              type: keyword
+            items:
+              type: nested
+              properties:
+                price:
+                  type: long
+- do:
+    bulk:
+      refresh: true
+      body:
+      - index:
+          _index: nr_synthetic
+          _id: "1"
+      - id: "1"
+        items:
+        - price: 10
+- do:
+    esql.query:
+      allow_partial_results: false
+      body:
+        query: FROM nr_synthetic | LIMIT 1 | MV_EXPAND id | EVAL total = NESTED(SUM(items.price)) | KEEP total
+- match:
+    values:
+    - [10]
+
+---
+synthetic source sums doc values after a sort and limit:
+- do:
+    indices.create:
+      index: nr_synthetic
+      body:
+        settings:
+          index.mapping.source.mode: synthetic
+          number_of_shards: 1
+          number_of_replicas: 0
+        mappings:
+          properties:
+            id:
+              type: keyword
+            items:
+              type: nested
+              properties:
+                price:
+                  type: long
+- do:
+    bulk:
+      refresh: true
+      body:
+      - index:
+          _index: nr_synthetic
+          _id: "1"
+      - id: "1"
+        items:
+        - price: 10
+- do:
+    esql.query:
+      allow_partial_results: false
+      body:
+        query: FROM nr_synthetic | SORT id | LIMIT 1 | EVAL total = NESTED(SUM(items.price)) | KEEP total
+- match:
+    values:
+    - [10]

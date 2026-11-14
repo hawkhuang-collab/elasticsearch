@@ -34,7 +34,6 @@ import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.UnaryExec;
 import org.elasticsearch.xpack.esql.plugin.EsqlFlags;
-import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
 import org.elasticsearch.xpack.esql.stats.SearchStats;
 
 import java.util.ArrayList;
@@ -61,9 +60,7 @@ public final class PushNestedPredicateToSource extends PhysicalOptimizerRules.Pa
     LocalPhysicalOptimizerContext> {
     @Override
     protected PhysicalPlan rule(FilterExec filter, LocalPhysicalOptimizerContext context) {
-        if (context.configuration().pragmas().nestedLoader() != QueryPragmas.NestedLoader.INDEX
-            || filter.child() instanceof NestedReduceExec == false
-            || scan(((NestedReduceExec) filter.child()).child()) == null) {
+        if (filter.child() instanceof NestedReduceExec == false || scan(((NestedReduceExec) filter.child()).child()) == null) {
             return filter;
         }
         NestedReduceExec reduce = (NestedReduceExec) filter.child();

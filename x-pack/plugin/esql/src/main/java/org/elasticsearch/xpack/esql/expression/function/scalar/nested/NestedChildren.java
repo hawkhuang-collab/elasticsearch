@@ -24,7 +24,6 @@ import org.elasticsearch.compute.operator.DriverContext;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
-import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.index.mapper.NestedObjectMapper;
 import org.elasticsearch.index.query.SearchExecutionContext;
 import org.elasticsearch.xpack.esql.core.tree.Source;
@@ -40,7 +39,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.Consumer;
-import java.util.function.IntPredicate;
 import java.util.stream.IntStream;
 
 /**
@@ -68,9 +66,10 @@ public final class NestedChildren implements Releasable {
     }
 
     /**
-     * Reads the child fields {@code paths}, relative to the nested field {@code path}, as {@code types}. Returns {@code null},
-     * meaning the values must come from {@code _source}, when no shards are local or a shard maps one of those fields
-     * without doc values.
+     * Reads the child fields {@code paths}, relative to the nested field {@code path}, as {@code types}. A field without doc
+     * values reads the child's object from the parent's {@code _source}, as a top-level field reads its document's. A shard
+     * that does not map {@code path} as nested gives its parents no children, and one that does not map a field gives nulls
+     * for it. Returns {@code null} when no shards are local.
      */
     @Nullable
     public static Factory factory(
@@ -84,15 +83,11 @@ public final class NestedChildren implements Releasable {
         }
         List<String> fields = paths.stream().map(p -> path + "." + p).toList();
         for (var shard : shardContexts.iterable()) {
-            if (shard instanceof EsPhysicalOperationProviders.DefaultShardContext == false || withoutDocValues(shard, fields) != null) {
+            if (shard instanceof EsPhysicalOperationProviders.DefaultShardContext == false) {
                 return null;
             }
         }
         IndexedByShardId<Shard> shards = shardContexts.map(shard -> {
-            String missing = withoutDocValues(shard, fields);
-            if (missing != null) {
-                throw new IllegalStateException("nested child field [" + missing + "] has no doc values on a later shard");
-            }
             SearchExecutionContext context = ((EsPhysicalOperationProviders.DefaultShardContext) shard).executionContext();
             NestedObjectMapper nested = context.nestedLookup().getNestedMappers().get(path);
             return new Shard(
@@ -127,7 +122,7 @@ public final class NestedChildren implements Releasable {
         var readers = shardContexts.map(
             s -> new ValuesSourceReaderOperator.ShardContext(
                 s.searcher().getIndexReader(),
-                s::newSourceLoader,
+                sourcePaths -> ((EsPhysicalOperationProviders.DefaultShardContext) s).newNestedChildSourceLoader(),
                 s.storedFieldsSequentialProportion()
             )
         );
@@ -144,17 +139,6 @@ public final class NestedChildren implements Releasable {
                 () -> 0
             )
         );
-    }
-
-    @Nullable
-    private static String withoutDocValues(EsPhysicalOperationProviders.ShardContext shard, List<String> fields) {
-        for (String field : fields) {
-            MappedFieldType type = shard.fieldType(field);
-            if (type != null && type.hasDocValues() == false) {
-                return field;
-            }
-        }
-        return null;
     }
 
     /** The {@code _doc} vector of {@code page}, or {@code null} when the page has no doc ids to read the index with. */
@@ -183,12 +167,12 @@ public final class NestedChildren implements Releasable {
     }
 
     /**
-     * Reads the children of the parents at the positions of {@code parents} that {@code included} accepts and hands them,
-     * in parent order, to {@code consumer} in pages of at most {@link #PAGE_SIZE} children. Block 0 of each page is an
+     * Reads the children of the parents at the positions of {@code parents} and hands them, in parent order, to
+     * {@code consumer} in pages of at most {@link #PAGE_SIZE} children. Block 0 of each page is an
      * {@link IntVector} of each child's parent position, and the child fields follow it. Each page is released once
      * {@code consumer} returns.
      */
-    void read(DocVector parents, IntPredicate included, Consumer<Page> consumer) {
+    void read(DocVector parents, Consumer<Page> consumer) {
         parents.ensureAttached("NESTED");
         int[] shardIds = new int[PAGE_SIZE];
         int[] segments = new int[PAGE_SIZE];
@@ -197,9 +181,6 @@ public final class NestedChildren implements Releasable {
         int count = 0;
         try {
             for (int p = 0; p < parents.getPositionCount(); p++) {
-                if (included.test(p) == false) {
-                    continue;
-                }
                 int shardId = parents.shards().getInt(p);
                 Shard shard = shards.get(shardId);
                 int segment = parents.segments().getInt(p);

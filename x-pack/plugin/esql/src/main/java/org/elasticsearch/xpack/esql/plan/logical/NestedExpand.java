@@ -25,9 +25,7 @@ import org.elasticsearch.xpack.esql.io.stream.PlanStreamInput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 
 /**
  * Turns each parent row into one row per object of a mapped nested field, repeating the parent columns.
@@ -48,20 +46,16 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
     private final boolean flatten;
     @Nullable
     private final NamedExpression target;
-    private final List<Attribute> metadata;
     @Nullable
     private final String path;
-    private final Set<String> indices;
     private final List<Attribute> expanded;
     private final List<String> paths;
-    private final List<Set<String>> mappedIndices;
-    private final Map<String, String> sourceFailures;
 
     private List<Attribute> output;
 
     /** The parsed, unbound command. */
     public NestedExpand(Source source, LogicalPlan child, boolean flatten, NamedExpression target) {
-        this(source, child, flatten, target, List.of(), null, Set.of(), List.of(), List.of(), List.of(), Map.of());
+        this(source, child, flatten, target, null, List.of(), List.of());
     }
 
     public NestedExpand(
@@ -69,24 +63,16 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
         LogicalPlan child,
         boolean flatten,
         @Nullable NamedExpression target,
-        List<Attribute> metadata,
         @Nullable String path,
-        Set<String> indices,
         List<Attribute> expanded,
-        List<String> paths,
-        List<Set<String>> mappedIndices,
-        Map<String, String> sourceFailures
+        List<String> paths
     ) {
         super(source, child);
         this.flatten = flatten;
         this.target = target;
-        this.metadata = List.copyOf(metadata);
         this.path = path;
-        this.indices = Set.copyOf(indices);
         this.expanded = List.copyOf(expanded);
         this.paths = List.copyOf(paths);
-        this.mappedIndices = mappedIndices.stream().map(Set::copyOf).toList();
-        this.sourceFailures = Map.copyOf(sourceFailures);
     }
 
     private NestedExpand(StreamInput in) throws IOException {
@@ -95,13 +81,9 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
             in.readNamedWriteable(LogicalPlan.class),
             in.readBoolean(),
             null,
-            in.readNamedWriteableCollectionAsList(Attribute.class),
             in.readString(),
-            in.readCollectionAsImmutableSet(StreamInput::readString),
             in.readNamedWriteableCollectionAsList(Attribute.class),
-            in.readStringCollectionAsList(),
-            in.readCollectionAsList(stream -> stream.readCollectionAsImmutableSet(StreamInput::readString)),
-            in.readImmutableMap(StreamInput::readString)
+            in.readStringCollectionAsList()
         );
     }
 
@@ -121,13 +103,9 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
         Source.EMPTY.writeTo(out);
         out.writeNamedWriteable(child());
         out.writeBoolean(flatten);
-        out.writeNamedWriteableCollection(metadata);
         out.writeString(path);
-        out.writeStringCollection(indices);
         out.writeNamedWriteableCollection(expanded);
         out.writeStringCollection(paths);
-        out.writeCollection(mappedIndices, StreamOutput::writeStringCollection);
-        out.writeMap(sourceFailures, StreamOutput::writeString);
     }
 
     @Override
@@ -163,18 +141,8 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
         return bound() ? path : target.name();
     }
 
-    /** Private {@code _source} and {@code _index} of the parent row. */
-    public List<Attribute> metadata() {
-        return metadata;
-    }
-
     public String path() {
         return path;
-    }
-
-    /** Indices where {@link #path()} is a mapped nested field. */
-    public Set<String> indices() {
-        return indices;
     }
 
     /** One column per child field, named by its full path. */
@@ -187,16 +155,6 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
         return paths;
     }
 
-    /** Indices where each child field is mapped. */
-    public List<Set<String>> mappedIndices() {
-        return mappedIndices;
-    }
-
-    /** Why the expansion cannot read the {@code _source} of some of {@link #indices()}, by index name. */
-    public Map<String, String> sourceFailures() {
-        return sourceFailures;
-    }
-
     @Override
     public boolean expressionsResolved() {
         return bound();
@@ -204,7 +162,7 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
 
     @Override
     protected AttributeSet computeReferences() {
-        return AttributeSet.of(metadata);
+        return AttributeSet.EMPTY;
     }
 
     @Override
@@ -231,37 +189,12 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
 
     @Override
     public NestedExpand replaceChild(LogicalPlan newChild) {
-        return new NestedExpand(
-            source(),
-            newChild,
-            flatten,
-            target,
-            metadata,
-            path,
-            indices,
-            expanded,
-            paths,
-            mappedIndices,
-            sourceFailures
-        );
+        return new NestedExpand(source(), newChild, flatten, target, path, expanded, paths);
     }
 
     @Override
     protected NodeInfo<NestedExpand> info() {
-        return NodeInfo.create(
-            this,
-            NestedExpand::new,
-            child(),
-            flatten,
-            target,
-            metadata,
-            path,
-            indices,
-            expanded,
-            paths,
-            mappedIndices,
-            sourceFailures
-        );
+        return NodeInfo.create(this, NestedExpand::new, child(), flatten, target, path, expanded, paths);
     }
 
     @Override
@@ -272,7 +205,7 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), flatten, target, metadata, path, indices, expanded, paths, mappedIndices, sourceFailures);
+        return Objects.hash(super.hashCode(), flatten, target, path, expanded, paths);
     }
 
     @Override
@@ -283,12 +216,8 @@ public final class NestedExpand extends UnaryPlan implements SortAgnostic {
         NestedExpand other = (NestedExpand) obj;
         return flatten == other.flatten
             && Objects.equals(target, other.target)
-            && metadata.equals(other.metadata)
             && Objects.equals(path, other.path)
-            && indices.equals(other.indices)
             && expanded.equals(other.expanded)
-            && paths.equals(other.paths)
-            && mappedIndices.equals(other.mappedIndices)
-            && sourceFailures.equals(other.sourceFailures);
+            && paths.equals(other.paths);
     }
 }

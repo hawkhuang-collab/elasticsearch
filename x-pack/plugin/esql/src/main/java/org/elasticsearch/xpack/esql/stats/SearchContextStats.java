@@ -245,6 +245,8 @@ public class SearchContextStats implements SearchStats {
                     return false;
                 }
                 mapped = true;
+            } else if (context.nestedLookup().hasNestedParent(field.string())) {
+                return false;
             }
         }
         return mapped;

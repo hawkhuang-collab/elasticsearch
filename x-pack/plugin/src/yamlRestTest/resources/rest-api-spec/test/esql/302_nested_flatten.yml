@@ -287,7 +287,7 @@ another nested field still reduces after flattening:
     - [[b1, b2], 2]
 
 ---
-a child field without doc values reads source on the data node:
+a child field without doc values reads the child's source:
 - do:
     indices.create:
       index: nf_text
@@ -326,7 +326,7 @@ a child field without doc values reads source on the data node:
         query: FROM nf_text | NESTED_FLATTEN items | KEEP items.tags, items.note | LIMIT 10
 - match:
     values:
-    - [[sale, new], [hello, world]]
+    - [[new, sale], [hello, world]]
 
 ---
 ordinary keyword field cannot be flattened:
