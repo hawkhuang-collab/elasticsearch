@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.analysis.rules;
 
 import org.elasticsearch.xpack.esql.VerificationException;
+import org.elasticsearch.xpack.esql.analysis.AnalyzerContext;
 import org.elasticsearch.xpack.esql.common.Failure;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
@@ -28,7 +29,7 @@ import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.join.Join;
 import org.elasticsearch.xpack.esql.plan.logical.join.LookupJoin;
-import org.elasticsearch.xpack.esql.rule.Rule;
+import org.elasticsearch.xpack.esql.rule.ParameterizedRule;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -40,7 +41,7 @@ import java.util.Map;
  * Binds {@code NESTED_ANY} to the private nested schema and lowers it to a {@link NestedPredicate}. Name resolution ignores
  * that schema, so {@link #scope} runs while attributes are still unresolved and this rule runs after implicit casting.
  */
-public final class BindNestedAny extends Rule<LogicalPlan, LogicalPlan> {
+public final class BindNestedAny extends ParameterizedRule<LogicalPlan, LogicalPlan, AnalyzerContext> {
     /** Rewrites nested names inside {@code NESTED_ANY} onto the private schema. Leaves every other name unresolved. */
     public static LogicalPlan scope(LogicalPlan plan, List<Attribute> childrenOutput) {
         return plan.transformExpressionsOnlyUp(NestedAny.class, nested -> nested.transformUp(UnresolvedAttribute.class, attribute -> {
@@ -50,11 +51,14 @@ public final class BindNestedAny extends Rule<LogicalPlan, LogicalPlan> {
     }
 
     @Override
-    public LogicalPlan apply(LogicalPlan plan) {
+    public LogicalPlan apply(LogicalPlan plan, AnalyzerContext context) {
         return plan.transformUp(p -> {
             NestedAny nested = find(p);
             if (nested == null) {
                 return p;
+            }
+            if (context.minimumVersion().supports(NestedPredicate.VERSION) == false) {
+                throw error(nested, "NESTED_ANY requires all nodes to support nested predicates");
             }
             if (p instanceof Filter == false && p instanceof Eval == false) {
                 throw error(nested, "NESTED_ANY is supported in EVAL and WHERE");
@@ -226,7 +230,8 @@ public final class BindNestedAny extends Rule<LogicalPlan, LogicalPlan> {
             Map.of(),
             attribute.name(),
             NestedScopeField.Kind.COLLECTION,
-            conflict
+            conflict,
+            null
         );
         return new FieldAttribute(attribute.source(), NestedScopeField.NAMESPACE, null, scopedName, scope, true);
     }
