@@ -109,6 +109,14 @@ public final class NestedPredicate extends EsqlScalarFunction {
         return body;
     }
 
+    public List<Attribute> inputs() {
+        return inputs;
+    }
+
+    public List<String> relativePaths() {
+        return relativePaths;
+    }
+
     @Override
     public DataType dataType() {
         return DataType.BOOLEAN;
