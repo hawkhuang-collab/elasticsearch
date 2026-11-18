@@ -1750,7 +1750,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
 
             // Nested fields are synthetic, so ordinary resolution cannot see them. Point NESTED_ANY and NESTED at that schema first.
             plan = BindNestedAny.scope(plan, childrenOutput);
-            plan = BindNested.scope(plan, childrenOutput);
+            plan = BindNested.scope(plan, childrenOutput, context.minimumVersion());
 
             var resolved = switch (plan) {
                 case Aggregate a -> resolveAggregate(a, childrenOutput);

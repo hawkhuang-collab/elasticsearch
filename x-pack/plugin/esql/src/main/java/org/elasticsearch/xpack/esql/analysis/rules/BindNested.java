@@ -40,25 +40,38 @@ import org.elasticsearch.xpack.esql.rule.Rule;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Binds {@code NESTED} to the private nested schema and lowers an ungrouped reduction to a {@link NestedReduce}.
  * {@link #scope} runs while attributes are still unresolved.
  */
 public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
-    public static LogicalPlan scope(LogicalPlan plan, List<Attribute> childrenOutput) {
-        return plan.transformExpressionsOnlyUp(NestedStats.class, nested -> nested.transformUp(UnresolvedAttribute.class, attribute -> {
-            Attribute field = nestedField(attribute, childrenOutput);
-            return field == null ? attribute : field;
-        }));
+    public static LogicalPlan scope(LogicalPlan plan, List<Attribute> childrenOutput, TransportVersion minimumVersion) {
+        return plan.transformExpressionsOnlyUp(NestedStats.class, nested -> {
+            if (minimumVersion.supports(NestedReduce.VERSION) == false) {
+                throw error(nested, "NESTED requires all nodes to support nested reductions");
+            }
+            List<Attribute> schema = privateSchema(plan.children(), childrenOutput);
+            return nested.transformUp(UnresolvedAttribute.class, attribute -> {
+                Attribute field = nestedField(attribute, schema);
+                return field == null ? attribute : field;
+            });
+        });
     }
 
     @Override
     public LogicalPlan apply(LogicalPlan plan) {
         if (containsNested(plan)) {
+            plan.forEachExpressionDown(NestedStats.class, nested -> {
+                if (nested.children().stream().anyMatch(child -> child.anyMatch(NestedStats.class::isInstance))) {
+                    throw error(nested, "NESTED does not allow inner scopes or full-text functions");
+                }
+            });
             plan.forEachExpressionDown(NamedExpression.class, expression -> {
                 if (expression.synthetic() == false
                     && (expression.name().startsWith(NestedScopeField.PREFIX) || expression.name().equals(NestedScopeField.NAMESPACE))) {
@@ -147,7 +160,7 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
             throw error(nested, "NESTED requires a mapped nested field");
         }
         String scopePath = path;
-        for (Attribute attribute : output) {
+        for (Attribute attribute : privateSchema(List.of(input), output)) {
             if (attribute instanceof FieldAttribute field
                 && field.field() instanceof NestedScopeField scope
                 && scopePath.startsWith(scope.path() + ".")) {
@@ -195,7 +208,7 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
         return new NestedReduce(nested.source(), path, bound, channels, paths);
     }
 
-    private static final java.util.Set<DataType> SUPPORTED = java.util.Set.of(
+    private static final Set<DataType> SUPPORTED = Set.of(
         DataType.BOOLEAN,
         DataType.INTEGER,
         DataType.LONG,
@@ -223,6 +236,36 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
             return scope.path();
         }
         throw error(nested, "NESTED requires a nested collection first, not [" + named.sourceText() + "]");
+    }
+
+    /**
+     * The nested fields the rows read from the index can offer. A projection drops them from the visible output, but the
+     * rows still come from the index, so the source relation's nested fields are in scope too.
+     */
+    private static List<Attribute> privateSchema(List<LogicalPlan> children, List<Attribute> visible) {
+        EsRelation relation = children.isEmpty() ? null : sourceRelation(children.getFirst());
+        if (relation == null) {
+            return visible;
+        }
+        Set<NameId> seen = new HashSet<>();
+        List<Attribute> schema = new ArrayList<>(visible);
+        for (Attribute attribute : visible) {
+            seen.add(attribute.id());
+        }
+        for (Attribute attribute : relation.output()) {
+            if (attribute instanceof FieldAttribute field && field.field() instanceof NestedScopeField && seen.add(attribute.id())) {
+                schema.add(attribute);
+            }
+        }
+        return schema;
+    }
+
+    private static EsRelation sourceRelation(LogicalPlan input) {
+        LogicalPlan plan = input;
+        while (plan instanceof EsRelation == false && plan.children().isEmpty() == false) {
+            plan = plan instanceof Join join ? join.left() : plan.children().getFirst();
+        }
+        return plan instanceof EsRelation relation ? relation : null;
     }
 
     private static Attribute nestedField(UnresolvedAttribute attribute, List<Attribute> output) {

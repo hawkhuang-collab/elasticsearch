@@ -17,6 +17,7 @@ import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.grouping.GroupingFunction;
+import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedReduce;
 import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNotNull;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
@@ -239,6 +240,13 @@ public class Mapper {
                 "NESTED_EXPAND must run on the data nodes, so it cannot follow [{}]",
                 unary.child().sourceText()
             );
+        }
+
+        // The reduction reads each row's child documents through its parent's _doc, which only the data nodes have.
+        boolean[] reducesNested = { false };
+        unary.forEachExpression(NestedReduce.class, reduction -> reducesNested[0] = true);
+        if (reducesNested[0]) {
+            throw new VerificationException("NESTED must run on the data nodes, so it cannot follow [{}]", unary.child().sourceText());
         }
 
         //

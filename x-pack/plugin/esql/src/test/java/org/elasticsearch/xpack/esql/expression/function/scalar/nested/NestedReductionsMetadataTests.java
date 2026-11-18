@@ -29,8 +29,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The nested scope comes from the rows of the FROM index, never from a lookup index or from rows a STATS made. The
- * 303_nested_metadata YAML tests run the accepted shapes against real indices.
+ * The nested scope comes from the rows of the FROM index, never from a lookup index or from rows a STATS made.
  */
 public class NestedReductionsMetadataTests extends LuceneTestCase {
     @Before

@@ -28,8 +28,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Analysis of nested fields that FROM branches map differently. The 303_nested_branches YAML tests run these shapes against
- * real indices.
+ * Analysis of nested fields that FROM branches map differently.
  */
 public class NestedReductionsBranchTests extends LuceneTestCase {
     @Before
