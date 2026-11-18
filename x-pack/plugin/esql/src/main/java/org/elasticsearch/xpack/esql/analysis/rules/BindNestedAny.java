@@ -78,7 +78,7 @@ public final class BindNestedAny extends Rule<LogicalPlan, LogicalPlan> {
             throw error(nested, "NESTED_ANY takes a predicate, or a collection and a predicate");
         }
         Expression body = nested.body();
-        if (body.anyMatch(e -> e instanceof NestedAny || e instanceof FullTextFunction)) {
+        if (body.anyMatch(e -> e instanceof NestedAny || e instanceof NestedPredicate || e instanceof FullTextFunction)) {
             throw error(nested, "NESTED_ANY does not allow inner scopes or full-text functions");
         }
         if (body.anyMatch(AggregateFunction.class::isInstance)) {

@@ -31,6 +31,7 @@ import org.elasticsearch.xpack.core.enrich.EnrichPolicy;
 import org.elasticsearch.xpack.esql.Column;
 import org.elasticsearch.xpack.esql.EsqlIllegalArgumentException;
 import org.elasticsearch.xpack.esql.VerificationException;
+import org.elasticsearch.xpack.esql.analysis.AnalyzerRules.AnalyzerRule;
 import org.elasticsearch.xpack.esql.analysis.AnalyzerRules.ParameterizedAnalyzerRule;
 import org.elasticsearch.xpack.esql.analysis.rules.BindNestedAny;
 import org.elasticsearch.xpack.esql.analysis.rules.DetermineUnmappedFieldsToKeep;
@@ -188,6 +189,7 @@ import org.elasticsearch.xpack.esql.plan.logical.ExternalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.FillNull;
 import org.elasticsearch.xpack.esql.plan.logical.Fork;
 import org.elasticsearch.xpack.esql.plan.logical.InlineStats;
+import org.elasticsearch.xpack.esql.plan.logical.Into;
 import org.elasticsearch.xpack.esql.plan.logical.IpLocation;
 import org.elasticsearch.xpack.esql.plan.logical.Keep;
 import org.elasticsearch.xpack.esql.plan.logical.Limit;
@@ -273,7 +275,6 @@ import static java.util.Collections.singletonList;
 import static org.elasticsearch.xpack.core.enrich.EnrichPolicy.GEO_MATCH_TYPE;
 import static org.elasticsearch.xpack.esql.capabilities.TranslationAware.translatable;
 import static org.elasticsearch.xpack.esql.core.expression.Expressions.keepExistingUnsupportedAttributes;
-import static org.elasticsearch.xpack.esql.core.expression.Expressions.toReferenceAttributesPreservingIds;
 import static org.elasticsearch.xpack.esql.core.type.DataType.AGGREGATE_METRIC_DOUBLE;
 import static org.elasticsearch.xpack.esql.core.type.DataType.DATETIME;
 import static org.elasticsearch.xpack.esql.core.type.DataType.DATE_NANOS;
@@ -370,6 +371,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 Limiter.ONCE,
                 new BindNestedAny(),
                 new HideNestedScopeFields(),
+                // Before ResolveDescribe replaces a ROW producer with a LocalRelation.
+                new RejectUnsupportedIntoSource(),
                 new ResolveDescribe(),
                 new DetermineUnmappedFieldsToKeep(),
                 new ResolveImplicitTimeSeriesIdentityGrouping(),
@@ -404,6 +407,13 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
     public Analyzer(AnalyzerContext context, Verifier verifier) {
         super(context);
         this.verifier = verifier;
+    }
+
+    /**
+     * Runs the analysis rules and returns the plan without verification, so a test can record that plan.
+     */
+    public LogicalPlan analyzeWithoutVerification(LogicalPlan plan) {
+        return execute(plan);
     }
 
     public LogicalPlan analyze(LogicalPlan plan) {
@@ -457,22 +467,45 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
     }
 
     /**
+     * Rejects an INTO whose producer is not ROW when {@code DESCRIBE} is about to replace that producer.
+     * A producer that verification can still see fails in {@link Into#postAnalysisVerification}, which
+     * {@code analyzeWithoutVerification} skips.
+     */
+    private static class RejectUnsupportedIntoSource extends AnalyzerRule<Into> {
+        @Override
+        protected boolean skipResolved() {
+            // Into is resolved by this batch, and the check still has to see it.
+            return false;
+        }
+
+        @Override
+        protected LogicalPlan rule(Into into) {
+            if (into.child().anyMatch(Describe.class::isInstance) && Into.unsupportedSource(into.child(), false)) {
+                throw new VerificationException(List.of(Failure.fail(into, "INTO currently only supports ROW as a source, without FORK")));
+            }
+            return into;
+        }
+    }
+
+    /**
      * Replaces {@code DESCRIBE} with a table describing its resolved child. Runs once resolution is done,
      * so the child's columns, renames and computed fields are final.
      */
     private static class ResolveDescribe extends ParameterizedAnalyzerRule<Describe, AnalyzerContext> {
         @Override
         protected LogicalPlan rule(Describe describe, AnalyzerContext context) {
-            if (describe.child().resolved() == false) {
+            if (describe.child().resolved() == false || describe.child().anyMatch(Into.class::isInstance)) {
                 return describe;
             }
             List<IndexResolution> resolutions = new ArrayList<>(context.indexResolution().values());
             resolutions.addAll(context.lookupResolution().values());
             Map<NameId, FieldSemantics> semantics = ColumnSemantics.collect(describe.child(), resolutions);
+            Map<NameId, Attribute> datasetColumns = ColumnSemantics.datasetColumns(describe.child());
             return describe.describe(
                 semantics,
-                ColumnSemantics.datasetColumns(describe.child()),
-                ColumnUnits.collect(describe.child(), semantics)
+                datasetColumns,
+                ColumnUnits.collect(describe.child(), semantics),
+                ColumnSemantics.timeColumns(describe.child(), semantics, datasetColumns)
             );
         }
 
@@ -612,6 +645,19 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
         return list;
     }
 
+    private static FieldAttribute fieldAttribute(Source source, String parentName, String name, EsField field, boolean synthetic) {
+        if (field instanceof UnsupportedEsField uef) {
+            return new UnsupportedAttribute(source, name, uef);
+        }
+        if (field instanceof InvalidMappedTsField imtf) {
+            // Convert the TS role conflict directly to an UnsupportedAttribute with a meaningful message.
+            // The original types don't matter. We pass a custom error message, anyway, which will fail the query in the verifier.
+            var carrier = new UnsupportedEsField(imtf.getName(), List.of(), null, imtf.getProperties());
+            return new UnsupportedAttribute(source, name, carrier, imtf.errorMessage());
+        }
+        return new FieldAttribute(source, parentName, null, name, field, synthetic);
+    }
+
     private static void mappingAsAttributes(List<Attribute> list, Source source, String parentName, Map<String, EsField> mapping) {
         for (Map.Entry<String, EsField> entry : mapping.entrySet()) {
             String name = entry.getKey();
@@ -623,19 +669,9 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 t = t.withWidenedSmallNumeric();
                 var type = t.getDataType();
 
-                FieldAttribute attribute;
-                if (t instanceof UnsupportedEsField uef) {
-                    attribute = new UnsupportedAttribute(source, name, uef);
-                } else if (t instanceof InvalidMappedTsField imtf) {
-                    // Convert the TS role conflict directly to an UnsupportedAttribute with a meaningful message.
-                    // The original types don't matter. We pass a custom error message, anyway, which will fail the query in the verifier.
-                    var carrier = new UnsupportedEsField(imtf.getName(), List.of(), null, imtf.getProperties());
-                    attribute = new UnsupportedAttribute(source, name, carrier, imtf.errorMessage());
-                } else {
-                    // Nested-scope fields exist only for NESTED_EXPAND. Marking them synthetic keeps them out of name
-                    // resolution and out of the query output.
-                    attribute = new FieldAttribute(source, parentName, null, name, t, t instanceof NestedScopeField);
-                }
+                // Nested-scope fields exist only for NESTED_EXPAND. Marking them synthetic keeps them out of name
+                // resolution and out of the query output.
+                FieldAttribute attribute = fieldAttribute(source, parentName, name, t, t instanceof NestedScopeField);
                 // primitive branch
                 if (DataType.isPrimitive(type)) {
                     list.add(attribute);
@@ -712,7 +748,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
      * Answers {@code _class} and {@code _name} for every view and subquery branch of a {@code FROM}, freezing them into
      * literal {@link Eval}s. It runs before {@link ViewCompactionPostIndexResolution}, while the branch wrappers are
      * still exactly as the parser and {@code ViewResolver} left them, so the answers never depend on what compaction
-     * later lifts, merges, or unwraps ({@link UnwrapNamedSubqueries} strips the view wrappers right after).
+     * later lifts, merges, or unwraps ({@link UnwrapNamedSubqueries} strips the view and LET wrappers right after).
      */
     private static class ResolveSubqueryRelationColumns extends ParameterizedAnalyzerRule<UnresolvedMetadata, AnalyzerContext> {
 
@@ -760,7 +796,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             for (Map.Entry<String, LogicalPlan> entry : vua.namedSubqueries().entrySet()) {
                 LogicalPlan branch = entry.getValue();
                 LogicalPlan answered = switch (branch) {
-                    case NamedSubquery view -> withRelationColumns(view, relationColumns, src, RelationClass.VIEW, view.name());
+                    case NamedSubquery named -> withRelationColumns(named, relationColumns, src, named.relationClass(), named.name());
                     case Subquery subquery -> withRelationColumns(subquery, relationColumns, src, RelationClass.SUBQUERY, null);
                     default -> {
                         BranchIdentity identity = vua.branchIdentity(entry.getKey());
@@ -778,7 +814,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
         /** Answers a lone (non-union) {@code FROM} target. A lone subquery's wrapper is consumed here, not left for compaction. */
         private static LogicalPlan answerLone(LogicalPlan child, List<NamedExpression> relationColumns, Source src) {
             return switch (child) {
-                case NamedSubquery view -> withRelationColumns(view, relationColumns, src, RelationClass.VIEW, view.name());
+                case NamedSubquery named -> withRelationColumns(named, relationColumns, src, named.relationClass(), named.name());
                 case Subquery subquery -> withRelationColumns(subquery.child(), relationColumns, src, RelationClass.SUBQUERY, null);
                 case LogicalPlan relation -> relation;
             };
@@ -1844,7 +1880,9 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             List<String> paths = new ArrayList<>();
             for (FieldAttribute child : children) {
                 String relative = child.name().substring(NestedScopeField.PREFIX.length() + path.length() + 1);
-                expanded.add(new ReferenceAttribute(expand.source(), path + "." + relative, child.dataType()));
+                String childName = path + "." + relative;
+                String parentName = childName.substring(0, childName.lastIndexOf('.'));
+                expanded.add(fieldAttribute(expand.source(), parentName, childName, ((NestedScopeField) child.field()).leaf(), false));
                 paths.add(relative);
             }
             return new NestedExpand(expand.source(), expand.child(), null, path, expanded, paths);
@@ -2618,15 +2656,14 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
 
             // The output has to be populated even when no branch changes: view resolution builds a BranchPlan with an empty
             // output and relies on this rule to fill it in.
-            return mergePlan.replaceSubPlansAndOutput(
-                changed ? newSubPlans : mergePlan.children(),
-                unmappedResolution.loadsAllUnmappedFields()
-                    ? keepExistingUnsupportedAttributes(
-                        toReferenceAttributesPreservingIds(outputUnion, mergePlan.output()),
-                        mergePlan.output()
-                    )
-                    : toReferenceAttributesPreservingIds(outputUnion, mergePlan.output())
-            );
+            newSubPlans = changed ? newSubPlans : mergePlan.children();
+            List<Attribute> newOutput = mergePlan.mergesScoreAsMetadata()
+                ? MergePlan.toReferenceAttributesPreservingIds(newSubPlans, outputUnion, mergePlan.output())
+                : Expressions.toReferenceAttributesPreservingIds(outputUnion, mergePlan.output());
+            if (unmappedResolution.loadsAllUnmappedFields()) {
+                newOutput = keepExistingUnsupportedAttributes(newOutput, mergePlan.output());
+            }
+            return mergePlan.replaceSubPlansAndOutput(newSubPlans, newOutput);
         }
 
         /**
@@ -3985,6 +4022,10 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
     private static class AddImplicitLimit extends ParameterizedRule<LogicalPlan, LogicalPlan, AnalyzerContext> {
         @Override
         public LogicalPlan apply(LogicalPlan logicalPlan, AnalyzerContext context) {
+            if (logicalPlan instanceof Into) {
+                // INTO returns one stats row, so the default 1000 cap must not truncate the rows it writes.
+                return logicalPlan;
+            }
             List<LogicalPlan> limits = logicalPlan.collectFirstChildren(Limit.class::isInstance);
             // We check whether the query contains a TimeSeriesAggregate to determine if we should apply
             // the default limit for TS queries or for non-TS queries.
@@ -4021,6 +4062,10 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
     private static class AddImplicitTimestampSort extends Rule<LogicalPlan, LogicalPlan> {
         @Override
         public LogicalPlan apply(LogicalPlan plan) {
+            if (plan instanceof Into) {
+                // INTO writes the rows as produced, so the implicit @timestamp sort must not be injected under it.
+                return plan;
+            }
             if (plan instanceof Limit limit) {
                 return injectTimestampSort(limit);
             }
@@ -4430,6 +4475,10 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
         private static class UnionTypeResolutionState {
             private final List<Attribute.IdIgnoringWrapper> unionFieldAttributes = new ArrayList<>();
             private boolean isAfterAggregate = false;
+            /** The children a {@code NESTED_EXPAND} reads, by id, with the relative path each is read from. */
+            private final Map<NameId, String> expandedChildren = new HashMap<>();
+            /** The generated attributes that convert an expanded child, by id, with the child they convert. */
+            private final Map<NameId, FieldAttribute> convertedChildren = new HashMap<>();
         }
 
         private static LogicalPlan doRule(LogicalPlan plan, UnionTypeResolutionState state, AnalyzerContext context) {
@@ -4445,6 +4494,12 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 }
             }
 
+            if (plan instanceof NestedExpand expand && expand.bound()) {
+                for (int i = 0; i < expand.expanded().size(); i++) {
+                    state.expandedChildren.put(expand.expanded().get(i).id(), expand.paths().get(i));
+                }
+            }
+
             if (state.isAfterAggregate) {
                 return plan;
             }
@@ -4454,7 +4509,14 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             // Replace the entire convert function with a new FieldAttribute (containing type conversion knowledge)
             plan = plan.transformExpressionsOnly(e -> {
                 if (e instanceof ConvertFunction convert) {
-                    return resolveConvertFunction(convert, state.unionFieldAttributes, context);
+                    int before = state.unionFieldAttributes.size();
+                    Expression resolved = resolveConvertFunction(convert, state.unionFieldAttributes, context);
+                    if (convertedField(convert) instanceof FieldAttribute child && state.expandedChildren.containsKey(child.id())) {
+                        for (int i = before; i < state.unionFieldAttributes.size(); i++) {
+                            state.convertedChildren.put(state.unionFieldAttributes.get(i).inner().id(), child);
+                        }
+                    }
+                    return resolved;
                 }
                 return e;
             });
@@ -4465,9 +4527,20 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             }
 
             if (generatedUnionFields) {
+                List<FieldAttribute> generated = state.unionFieldAttributes.stream().map(attr -> (FieldAttribute) attr.inner()).toList();
+                // An expanded child is not a field of the relation: its conversion is part of the expansion that reads it.
+                if (state.convertedChildren.isEmpty() == false) {
+                    plan = addGeneratedFieldsToNestedExpands(plan, generated, state);
+                    Set<NameId> convertedChildren = state.convertedChildren.keySet();
+                    plan = carryOverSyntheticAttributesThroughProjects(
+                        plan,
+                        attr -> convertedChildren.contains(attr.id()),
+                        context.unmappedResolution().loadsAllUnmappedFields()
+                    );
+                }
                 plan = addGeneratedFieldsToEsRelations(
                     plan,
-                    state.unionFieldAttributes.stream().map(attr -> (FieldAttribute) attr.inner()).toList(),
+                    generated.stream().filter(fa -> state.convertedChildren.containsKey(fa.id()) == false).toList(),
                     context.unmappedResolution().loadsAllUnmappedFields()
                 );
             }
@@ -4478,6 +4551,50 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 state.isAfterAggregate = true;
             }
             return plan;
+        }
+
+        /** The field a convert reads, looking through the converts it is nested in, as in {@code foo::long::double}. */
+        private static Expression convertedField(ConvertFunction convert) {
+            Expression field = convert.field();
+            while (field instanceof ConvertFunction inner) {
+                field = inner.field();
+            }
+            return field;
+        }
+
+        /**
+         * Adds the generated attributes that convert a child of a {@code NESTED_EXPAND} to that expansion, which reads the child
+         * from each shard's mapping and converts it there.
+         */
+        private static LogicalPlan addGeneratedFieldsToNestedExpands(
+            LogicalPlan plan,
+            List<FieldAttribute> unionFieldAttributes,
+            UnionTypeResolutionState state
+        ) {
+            return plan.transformDown(NestedExpand.class, expand -> {
+                if (expand.bound() == false) {
+                    return expand;
+                }
+                List<Attribute> expanded = new ArrayList<>(expand.expanded());
+                List<String> paths = new ArrayList<>(expand.paths());
+                for (FieldAttribute generated : unionFieldAttributes) {
+                    FieldAttribute child = state.convertedChildren.get(generated.id());
+                    int index = -1;
+                    for (int i = 0; child != null && i < expand.expanded().size(); i++) {
+                        if (expand.expanded().get(i).id().equals(child.id())) {
+                            index = i;
+                            break;
+                        }
+                    }
+                    if (index >= 0 && expanded.contains(generated) == false) {
+                        expanded.add(generated);
+                        paths.add(expand.paths().get(index));
+                    }
+                }
+                return expanded.size() == expand.expanded().size()
+                    ? expand
+                    : new NestedExpand(expand.source(), expand.child(), null, expand.path(), expanded, paths);
+            });
         }
 
         /**
@@ -4994,6 +5111,11 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
         }
 
         private static LogicalPlan planWithoutSyntheticAttributes(LogicalPlan plan) {
+            if (plan instanceof Into into) {
+                // An IN-subquery mark ($$...) must not be written as a document field.
+                LogicalPlan newChild = planWithoutSyntheticAttributes(into.child());
+                return newChild == into.child() ? into : into.replaceChild(newChild);
+            }
             // Virtual columns on the EXTERNAL command path stay out of default output unless a Keep
             // projection lists them. A DROP also resolves to a Project that carries surviving virtual
             // columns forward via childOutput, but that is not the user keeping them, so we scan only
@@ -6570,6 +6692,18 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
      * overload that also gates synthetics against the enclosing {@link MergePlan} output.
      */
     private static LogicalPlan carryOverSyntheticAttributesThroughProjects(LogicalPlan plan, boolean preserveResolvingProject) {
+        return carryOverSyntheticAttributesThroughProjects(plan, Attribute::synthetic, preserveResolvingProject);
+    }
+
+    /**
+     * As {@link #carryOverSyntheticAttributesThroughProjects(LogicalPlan, boolean)}, but carrying over only the synthetic attributes
+     * that {@code carried} accepts.
+     */
+    private static LogicalPlan carryOverSyntheticAttributesThroughProjects(
+        LogicalPlan plan,
+        Predicate<Attribute> carried,
+        boolean preserveResolvingProject
+    ) {
         return plan.transformUp(Project.class, p -> {
             // Skip Projects whose projections are not yet resolved (e.g. an unexpanded KEEP wildcard sitting above a still-unresolved
             // union-typed field reference). Their output cannot be computed yet — calling p.output() would throw UnresolvedException.
@@ -6579,7 +6713,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             }
             List<Attribute> syntheticAttributesToCarryOver = new ArrayList<>();
             for (Attribute attr : p.inputSet()) {
-                if (attr.synthetic() && p.outputSet().contains(attr) == false) {
+                if (attr.synthetic() && carried.test(attr) && p.outputSet().contains(attr) == false) {
                     syntheticAttributesToCarryOver.add(attr);
                 }
             }

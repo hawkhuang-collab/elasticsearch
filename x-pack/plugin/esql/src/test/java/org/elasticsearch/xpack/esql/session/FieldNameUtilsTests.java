@@ -20,7 +20,6 @@ import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.UnresolvedAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
-import org.elasticsearch.xpack.esql.core.type.NestedScopeField;
 import org.elasticsearch.xpack.esql.expression.function.UnresolvedFunction;
 import org.elasticsearch.xpack.esql.plan.IndexPattern;
 import org.elasticsearch.xpack.esql.plan.LinkedIndexPattern;
@@ -30,10 +29,10 @@ import org.elasticsearch.xpack.esql.plan.logical.BranchPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.Keep;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
-import org.elasticsearch.xpack.esql.plan.logical.NamedSubquery;
 import org.elasticsearch.xpack.esql.plan.logical.UnresolvedExternalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.UnresolvedRelation;
 import org.elasticsearch.xpack.esql.plan.logical.ViewShadowRelation;
+import org.elasticsearch.xpack.esql.plan.logical.ViewSubquery;
 
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -48,6 +47,7 @@ import static org.elasticsearch.xpack.esql.session.IndexResolver.ALL_FIELDS;
 import static org.elasticsearch.xpack.esql.session.IndexResolver.INDEX_METADATA_FIELD;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
 
 public class FieldNameUtilsTests extends ESTestCase {
@@ -90,15 +90,15 @@ public class FieldNameUtilsTests extends ESTestCase {
     }
 
     public void testNestedPredicateAsksForItsFieldsAndTheParentFields() {
-        assertFieldNames(
-            "from test | where nested_any(items.price > 1) | keep id",
-            Set.of("id", "id.*", "items.price", "items.price.*", "items", "items.*", "_index", NestedScopeField.REQUEST_MARKER)
-        );
+        String query = "from test | where nested_any(items.price > 1) | keep id";
+        assertFieldNames(query, Set.of("id", "id.*", "items.price", "items.price.*", "items", "items.*", "_index"));
+        assertThat(nestedScope(query), is(true));
     }
 
-    /** A query that needs every field still asks for all of them, plus the nested-field marker. */
     public void testNestedWithoutNarrowingAsksForAllFields() {
-        assertFieldNames("from test | where nested_any(items.price > 1)", Set.of("*", NestedScopeField.REQUEST_MARKER));
+        String query = "from test | where nested_any(items.price > 1)";
+        assertFieldNames(query, Set.of("*"));
+        assertThat(nestedScope(query), is(true));
     }
 
     public void testSimple1() {
@@ -4849,7 +4849,7 @@ public class FieldNameUtilsTests extends ESTestCase {
             List.of(new UnresolvedAttribute(Source.EMPTY, "a"))
         );
         LinkedHashMap<String, LogicalPlan> branches = new LinkedHashMap<>();
-        branches.put("v", new NamedSubquery(Source.EMPTY, viewBody, "v"));
+        branches.put("v", new ViewSubquery(Source.EMPTY, viewBody, "v"));
         branches.put("v#shadow", new ViewShadowRelation(Source.EMPTY, "v", LinkedIndexPattern.Kind.OPTIONAL, "v"));
         BranchPlan plan = new BranchPlan(Source.EMPTY, branches, Map.of("v", BranchIdentity.view("v")), List.of());
         assertThat(FieldNameUtils.resolveFieldNames(plan, false, includePrefixFields).fieldNames(), equalTo(ALL_FIELDS));
@@ -4900,6 +4900,11 @@ public class FieldNameUtilsTests extends ESTestCase {
         var preAnalysisResult = FieldNameUtils.resolveFieldNames(parsed, false, includePrefixFields);
         assertThat("Parent paths", preAnalysisResult.parentPaths(), equalTo(expected));
         assertThat("Parent paths are requested", preAnalysisResult.fieldNames().containsAll(expected), equalTo(true));
+    }
+
+    private boolean nestedScope(String query) {
+        var parsed = InSubqueryResolver.resolve(TEST_PARSER.parseQuery(query));
+        return FieldNameUtils.resolveFieldNames(parsed, false, includePrefixFields).nestedScope();
     }
 
     private void assertFieldNames(String query, Set<String> expected) {
