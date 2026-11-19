@@ -12,6 +12,8 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.TransportVersion;
+import org.elasticsearch.action.fieldcaps.FieldCapabilities;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
@@ -39,12 +41,14 @@ import org.elasticsearch.index.mapper.SourceToParse;
 import org.elasticsearch.index.query.SearchExecutionContext;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.search.internal.AliasFilter;
+import org.elasticsearch.test.TransportVersionUtils;
 import org.elasticsearch.xcontent.XContentType;
 import org.elasticsearch.xpack.esql.EsqlTestUtils;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.core.type.UnionTypeEsField;
 import org.elasticsearch.xpack.esql.expression.function.BlockLoaderWarnings;
+import org.elasticsearch.xpack.esql.plan.logical.NestedExpand;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
 import org.elasticsearch.xpack.esql.planner.PlannerUtils;
@@ -63,7 +67,8 @@ import static org.hamcrest.Matchers.equalTo;
 /**
  * Reads the children of real nested documents through {@link NestedChildren}, which picks and wraps the block loader of each
  * child field, so {@link NestedChildSourceBlockLoader} is driven the way a query drives it. A runtime field without a script reads
- * its values from the parent's {@code _source}, wherever it is named, and is read with the parent documents rather than the children.
+ * its values from the parent's {@code _source}, wherever it is named. A cluster that reports runtime fields reads it with the
+ * parent documents; a cluster that does not copies the parent's value onto each child.
  */
 public class NestedChildLoadersTests extends ComputeTestCase {
     private static final Settings SYNTHETIC = Settings.builder().put("index.mapping.source.mode", "synthetic").build();
@@ -140,6 +145,28 @@ public class NestedChildLoadersTests extends ComputeTestCase {
                 List.of(DataType.LONG, DataType.LONG)
             );
             assertThat(rows, equalTo(List.of(row(0, 1L, null), row(0, 2L, null))));
+            closeIndexForNextRun();
+        }
+    }
+
+    /**
+     * A data node whose cluster still has a node that does not report runtime fields must return the parent's values. That node
+     * plans the runtime field as the child, and it is the only copy of the value the query reads.
+     */
+    public void testRuntimeFieldReadsTheParentForAClusterThatDoesNotReportRuntimeFields() throws IOException {
+        TransportVersion beforeRuntimeFields = TransportVersionUtils.getPreviousVersion(FieldCapabilities.FIELD_CAPS_RUNTIME_FIELD);
+        assumeTrue("the nested expansion is older than runtime fields in field caps", beforeRuntimeFields.supports(NestedExpand.VERSION));
+        for (Settings settings : List.of(Settings.EMPTY, SYNTHETIC)) {
+            List<List<Object>> rows = readChildren(
+                settings,
+                runtimeMapping("long"),
+                List.of("""
+                    {"items": [{"qty": 1, "calc": 3}, {"qty": 2, "calc": 4}]}"""),
+                List.of("qty", "calc"),
+                List.of(DataType.LONG, DataType.LONG),
+                beforeRuntimeFields
+            );
+            assertThat(rows, equalTo(List.of(row(0, 1L, List.of(3L, 4L)), row(0, 2L, List.of(3L, 4L)))));
             closeIndexForNextRun();
         }
     }
@@ -397,6 +424,17 @@ public class NestedChildLoadersTests extends ComputeTestCase {
         List<String> paths,
         List<DataType> types
     ) throws IOException {
+        return readChildren(settings, mapping, documents, paths, types, TransportVersion.current());
+    }
+
+    private List<List<Object>> readChildren(
+        Settings settings,
+        String mapping,
+        List<String> documents,
+        List<String> paths,
+        List<DataType> types,
+        TransportVersion minTransportVersion
+    ) throws IOException {
         index(settings, mapping, documents);
         NestedChildren.Factory factory = NestedChildren.factory(
             new IndexedByShardIdFromSingleton<>(shard),
@@ -405,7 +443,8 @@ public class NestedChildLoadersTests extends ComputeTestCase {
             types,
             Collections.nCopies(paths.size(), (UnionTypeEsField) null),
             PlannerSettings.DEFAULTS,
-            EsqlTestUtils.TEST_CFG
+            EsqlTestUtils.TEST_CFG,
+            minTransportVersion
         );
         BlockFactory blockFactory = blockFactory();
         DriverContext driverContext = new DriverContext(blockFactory.bigArrays(), blockFactory, null);

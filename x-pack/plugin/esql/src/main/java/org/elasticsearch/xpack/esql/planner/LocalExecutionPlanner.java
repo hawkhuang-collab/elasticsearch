@@ -2987,7 +2987,8 @@ public class LocalExecutionPlanner {
             types,
             expand.expanded().stream().map(EsPhysicalOperationProviders::findUnionTypes).toList(),
             context.plannerSettings,
-            configuration
+            configuration,
+            minTransportVersion
         );
         return source.with(new NestedExpandOperator.Factory(docChannel, children, expand.path(), types), layout.build());
     }

@@ -10,6 +10,8 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.join.BitSetProducer;
 import org.apache.lucene.util.BitSet;
+import org.elasticsearch.TransportVersion;
+import org.elasticsearch.action.fieldcaps.FieldCapabilities;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.lucene.search.Queries;
 import org.elasticsearch.compute.data.BlockFactory;
@@ -74,15 +76,7 @@ public final class NestedChildren implements Releasable {
         }
     }
 
-    /**
-     * Reads the child fields {@code paths}, relative to the nested field {@code path}, as {@code types}. A field without doc
-     * values reads the child's object from the parent's {@code _source}, as a top-level field reads its document's. A shard
-     * that does not map {@code path} as nested gives its parents no children, and one that does not map a field gives nulls
-     * for it. Each shard is only looked at once a page of its parents is read: a driver may get the factory after the
-     * shards of other drivers are released. The children load with the same {@code settings} as their parents. A shard that
-     * holds a field as a key of a {@code flattened} field converts its keyword values to the field's type with the field's
-     * {@code keyCasts} entry, and gives nulls without one.
-     */
+    /** Reads the children for a cluster on the current transport version. */
     public static Factory factory(
         IndexedByShardId<? extends EsPhysicalOperationProviders.ShardContext> shardContexts,
         String path,
@@ -91,6 +85,31 @@ public final class NestedChildren implements Releasable {
         List<UnionTypeEsField> unionTypes,
         PlannerSettings settings,
         Configuration configuration
+    ) {
+        return factory(shardContexts, path, paths, types, unionTypes, settings, configuration, TransportVersion.current());
+    }
+
+    /**
+     * Reads the child fields {@code paths}, relative to the nested field {@code path}, as {@code types}. A field without doc
+     * values reads the child's object from the parent's {@code _source}, as a top-level field reads its document's. A shard
+     * that does not map {@code path} as nested gives its parents no children, and one that does not map a field gives nulls
+     * for it. Each shard is only looked at once a page of its parents is read: a driver may get the factory after the
+     * shards of other drivers are released. The children load with the same {@code settings} as their parents. A shard that
+     * holds a field as a key of a {@code flattened} field converts its keyword values to the field's type with the field's
+     * {@code keyCasts} entry, and gives nulls without one. A runtime field is a field of the parent. When
+     * {@code minTransportVersion} reports runtime fields, this returns nulls for it, because every coordinator reads the
+     * parent's column. When it does not, each child gets the value the field computed for its parent, because a coordinator
+     * of that version lists the field as the child and reads no other copy.
+     */
+    public static Factory factory(
+        IndexedByShardId<? extends EsPhysicalOperationProviders.ShardContext> shardContexts,
+        String path,
+        List<String> paths,
+        List<DataType> types,
+        List<UnionTypeEsField> unionTypes,
+        PlannerSettings settings,
+        Configuration configuration,
+        TransportVersion minTransportVersion
     ) {
         List<String> fields = paths.stream().map(p -> path + "." + p).toList();
         IndexedByShardId<Shard> shards = shardContexts.map(shard -> {
@@ -126,8 +145,9 @@ public final class NestedChildren implements Releasable {
                 if (fieldType instanceof FlattenedFieldMapper.KeyedFlattenedFieldType) {
                     return keyChild(context, driverContext, name, type, union, settings, configuration);
                 }
-                if (fieldType instanceof AbstractScriptFieldType) {
-                    // A runtime field is a field of the parent documents, so this shard has no such child
+                if (fieldType instanceof AbstractScriptFieldType
+                    && minTransportVersion.supports(FieldCapabilities.FIELD_CAPS_RUNTIME_FIELD)) {
+                    // Every coordinator on this version plans the name as a column of the parent, so this shard has no child value
                     return ValuesSourceReaderOperator.LOAD_CONSTANT_NULLS;
                 }
                 BlockLoader loader = context.nestedChildBlockLoader(
@@ -143,7 +163,17 @@ public final class NestedChildren implements Releasable {
                     Set<String> sourcePaths = context.executionContext().sourcePath(fieldType.name());
                     loader = new NestedChildSourceBlockLoader(fallback, sourcePaths.isEmpty() ? Set.of(fieldType.name()) : sourcePaths);
                 }
-                if (loader.rowStrideStoredFieldSpec().requiresSource() && context.storesFilteredSource()) {
+                BitSetProducer parents = shards.get(shard).parents();
+                if (fieldType instanceof AbstractScriptFieldType && parents != null) {
+                    // A coordinator that does not report runtime fields still names this field as the child, and it is the only
+                    // copy of the value the query reads, so each child gets the value the script computed for its parent
+                    loader = new NestedParentBlockLoader(
+                        loader,
+                        parents,
+                        context::newSourceLoader,
+                        NestedParentBlockLoader.valueBlockFactory(driverContext.blockFactory())
+                    );
+                } else if (loader.rowStrideStoredFieldSpec().requiresSource() && context.storesFilteredSource()) {
                     driverContext.addWarning(
                         Strings.format(
                             "Field [%s] cannot be retrieved from the filtered _source of index [%s]; returning null",
