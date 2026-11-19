@@ -43,10 +43,13 @@ import java.util.Map;
 public final class BindNestedAny extends Rule<LogicalPlan, LogicalPlan> {
     /** Rewrites nested names inside {@code NESTED_ANY} onto the private schema. Leaves every other name unresolved. */
     public static LogicalPlan scope(LogicalPlan plan, List<Attribute> childrenOutput) {
-        return plan.transformExpressionsOnlyUp(NestedAny.class, nested -> nested.transformUp(UnresolvedAttribute.class, attribute -> {
-            Attribute field = nestedField(attribute, childrenOutput);
-            return field == null ? attribute : field;
-        }));
+        return plan.transformExpressionsOnlyUp(NestedAny.class, nested -> {
+            var dereference = NestedReference.dereferencer(plan.children().isEmpty() ? null : plan.children().getFirst());
+            return nested.transformUp(UnresolvedAttribute.class, attribute -> {
+                Attribute field = nestedField(dereference.apply(attribute), childrenOutput);
+                return field == null ? attribute : field;
+            });
+        });
     }
 
     @Override

@@ -34,7 +34,10 @@ import org.elasticsearch.xpack.esql.VerificationException;
 import org.elasticsearch.xpack.esql.analysis.AnalyzerRules.ParameterizedAnalyzerRule;
 import org.elasticsearch.xpack.esql.analysis.rules.BindNested;
 import org.elasticsearch.xpack.esql.analysis.rules.BindNestedAny;
+import org.elasticsearch.xpack.esql.analysis.rules.BindNestedObject;
 import org.elasticsearch.xpack.esql.analysis.rules.DetermineUnmappedFieldsToKeep;
+import org.elasticsearch.xpack.esql.analysis.rules.NestedReference;
+import org.elasticsearch.xpack.esql.analysis.rules.RemoveNestedReferences;
 import org.elasticsearch.xpack.esql.analysis.rules.ResolveFunctions;
 import org.elasticsearch.xpack.esql.analysis.rules.ResolveHighlight;
 import org.elasticsearch.xpack.esql.analysis.rules.ResolveHighlightFieldMappings;
@@ -148,6 +151,7 @@ import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToString;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToText;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToUnsignedLong;
 import org.elasticsearch.xpack.esql.expression.function.scalar.multivalue.MvCount;
+import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedObject;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedPredicate;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedReduce;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nulls.Coalesce;
@@ -370,9 +374,11 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             new Batch<>(
                 "Finish Analysis",
                 Limiter.ONCE,
+                new BindNestedObject(),
                 new BindNestedAny(),
                 new BindNested(),
                 new HideNestedScopeFields(),
+                new RemoveNestedReferences(),
                 new ResolveDescribe(),
                 new DetermineUnmappedFieldsToKeep(),
                 new ResolveImplicitTimeSeriesIdentityGrouping(),
@@ -884,6 +890,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             boolean[] found = { false };
             plan.forEachExpressionDown(NestedPredicate.class, predicate -> found[0] = true);
             plan.forEachExpressionDown(NestedReduce.class, reduction -> found[0] = true);
+            plan.forEachExpressionDown(NestedObject.class, reference -> found[0] = true);
             return found[0];
         }
     }
@@ -1751,6 +1758,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             // Nested fields are synthetic, so ordinary resolution cannot see them. Point NESTED_ANY and NESTED at that schema first.
             plan = BindNestedAny.scope(plan, childrenOutput);
             plan = BindNested.scope(plan, childrenOutput, context.minimumVersion());
+            plan = BindNestedObject.scope(plan, childrenOutput);
 
             var resolved = switch (plan) {
                 case Aggregate a -> resolveAggregate(a, childrenOutput);
@@ -1792,7 +1800,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 throw nestedExpandError(target, "NESTED_EXPAND requires all nodes to support nested expansion");
             }
             String name = target.name();
-            String rootName = NestedScopeField.PREFIX + name;
+            String referenced = NestedReference.referencedPath(expand.child(), name);
+            String rootName = NestedScopeField.PREFIX + (referenced != null ? referenced : name);
             FieldAttribute root = null;
             Set<String> collections = new HashSet<>();
             for (Attribute attribute : childrenOutput) {
@@ -1849,7 +1858,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             List<String> paths = new ArrayList<>();
             for (FieldAttribute child : children) {
                 String relative = child.name().substring(NestedScopeField.PREFIX.length() + path.length() + 1);
-                expanded.add(new ReferenceAttribute(expand.source(), path + "." + relative, child.dataType()));
+                expanded.add(new ReferenceAttribute(expand.source(), name + "." + relative, child.dataType()));
                 paths.add(relative);
             }
             return new NestedExpand(expand.source(), expand.child(), null, path, expanded, paths);

@@ -97,6 +97,24 @@ public class FieldNameUtilsTests extends ESTestCase {
         );
     }
 
+    /**
+     * A NESTED_OBJECT reference can name any child field of its collection later, so the collection and its children are
+     * asked for. The names read through the reference are asked for too: analysis only resolves them to the collection later.
+     */
+    public void testNestedObjectAsksForTheWholeCollection() {
+        assertFieldNames(
+            "from test | eval o = nested_object(items) | eval n = nested(count(o.price)) | keep n",
+            Set.of("items", "items.*", "o", "o.*", "o.price", "o.price.*", "_index", NestedScopeField.REQUEST_MARKER)
+        );
+    }
+
+    public void testNestedObjectAloneAsksForTheCollection() {
+        assertFieldNames(
+            "from test | eval o = nested_object(items) | keep id",
+            Set.of("items", "items.*", "id", "id.*", "_index", NestedScopeField.REQUEST_MARKER)
+        );
+    }
+
     public void testSimple1() {
         assertFieldNames(
             "from employees | sort emp_no | keep emp_no, still_hired | limit 3",

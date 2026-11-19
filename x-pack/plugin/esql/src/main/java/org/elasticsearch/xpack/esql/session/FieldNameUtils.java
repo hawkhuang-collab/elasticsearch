@@ -119,10 +119,13 @@ public class FieldNameUtils {
                 collections.add(expand.target().name());
             }
         });
-        // NESTED_ANY names child fields the same way. The marker keeps them in the private schema instead of dropping them.
+        // NESTED_ANY, NESTED and NESTED_OBJECT name child fields the same way. The marker keeps them in the private schema
+        // instead of dropping them.
         parsed.forEachExpressionDown(UnresolvedFunction.class, function -> {
             String functionName = function.name();
-            if (functionName.equalsIgnoreCase("nested_any") == false && functionName.equalsIgnoreCase("nested") == false) {
+            if (functionName.equalsIgnoreCase("nested_any") == false
+                && functionName.equalsIgnoreCase("nested") == false
+                && functionName.equalsIgnoreCase("nested_object") == false) {
                 return;
             }
             function.forEachDown(UnresolvedAttribute.class, attribute -> {

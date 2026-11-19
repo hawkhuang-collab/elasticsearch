@@ -200,6 +200,7 @@ import org.elasticsearch.xpack.esql.expression.function.scalar.multivalue.MvSum;
 import org.elasticsearch.xpack.esql.expression.function.scalar.multivalue.MvUnion;
 import org.elasticsearch.xpack.esql.expression.function.scalar.multivalue.MvZip;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedAny;
+import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedObject;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nested.NestedStats;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nulls.Coalesce;
 import org.elasticsearch.xpack.esql.expression.function.scalar.score.Decay;
@@ -691,6 +692,8 @@ public class EsqlFunctionRegistry {
                 NestedAny.DEFINITION,
                 // NESTED reductions are snapshot-only until the aggregate is advertised.
                 NestedStats.DEFINITION,
+                // NESTED_OBJECT only names a nested collection for the NESTED functions, so it is snapshot-only with them.
+                NestedObject.DEFINITION,
                 // TSTEP is new enough that we only want to expose it on snapshot builds for now.
                 TStep.DEFINITION,
                 // dense vector functions

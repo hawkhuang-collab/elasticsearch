@@ -91,6 +91,14 @@ public final class NestedReduce extends EsqlScalarFunction {
         );
     }
 
+    public String path() {
+        return path;
+    }
+
+    public List<String> relativePaths() {
+        return relativePaths;
+    }
+
     public static void checkVersion(StreamOutput out) throws IOException {
         if (out.getTransportVersion().supports(VERSION) == false) {
             throw new IOException("NESTED requires nested reduction transport support");

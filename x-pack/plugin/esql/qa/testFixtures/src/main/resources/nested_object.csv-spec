@@ -1,0 +1,151 @@
+// NESTED_OBJECT over nested_orders: order 1 has items a (qty 1) and b (qty 2) and one event, order 2 has neither,
+// order 3 has item c (qty 5) and two events. A reference only names a collection, so it is never a column.
+
+reduceThroughAReference
+required_capability: fn_nested_object
+required_capability: fn_nested
+
+FROM nested_orders
+| EVAL o = NESTED_OBJECT(items)
+| EVAL s = NESTED(SUM(o.qty)), n = NESTED(o, COUNT(*))
+| KEEP id, s, n
+| SORT id
+;
+
+id:keyword | s:long | n:long
+1          | 3      | 2
+2          | null   | 0
+3          | 5      | 1
+;
+
+predicateThroughAReference
+required_capability: fn_nested_object
+required_capability: fn_nested_any
+
+FROM nested_orders
+| EVAL o = NESTED_OBJECT(items)
+| WHERE NESTED_ANY(o.qty > 1)
+| KEEP id
+| SORT id
+;
+
+id:keyword
+1
+3
+;
+
+existenceThroughAReference
+required_capability: fn_nested_object
+required_capability: fn_nested_any
+
+FROM nested_orders
+| EVAL o = NESTED_OBJECT(items)
+| WHERE NOT NESTED_ANY(o, true)
+| KEEP id
+;
+
+id:keyword
+2
+;
+
+expandThroughAReference
+required_capability: fn_nested_object
+required_capability: nested_expand
+
+FROM nested_orders
+| EVAL o = NESTED_OBJECT(items)
+| NESTED_EXPAND o
+| KEEP id, o.sku, o.qty
+| SORT id, o.sku
+;
+
+id:keyword | o.sku:keyword | o.qty:long
+1          | a             | 1
+1          | b             | 2
+2          | null          | null
+3          | c             | 5
+;
+
+renamedReference
+required_capability: fn_nested_object
+required_capability: fn_nested
+
+FROM nested_orders
+| EVAL o = NESTED_OBJECT(items)
+| RENAME o AS products
+| EVAL s = NESTED(SUM(products.qty))
+| KEEP id, s
+| SORT id
+;
+
+id:keyword | s:long
+1          | 3
+2          | null
+3          | 5
+;
+
+twoReferences
+required_capability: fn_nested_object
+required_capability: fn_nested
+
+FROM nested_orders
+| EVAL a = NESTED_OBJECT(items), b = NESTED_OBJECT(events)
+| EVAL itemCount = NESTED(a, COUNT(*)), eventCount = NESTED(b, COUNT(*))
+| KEEP id, itemCount, eventCount
+| SORT id
+;
+
+id:keyword | itemCount:long | eventCount:long
+1          | 2              | 1
+2          | 0              | 0
+3          | 1              | 2
+;
+
+referenceIsNotAColumn
+required_capability: fn_nested_object
+
+FROM nested_orders
+| EVAL o = NESTED_OBJECT(items)
+| KEEP id, o
+| SORT id
+;
+
+id:keyword
+1
+2
+3
+;
+
+referenceKeptByAWildcard
+required_capability: fn_nested_object
+
+FROM nested_orders
+| EVAL o = NESTED_OBJECT(events)
+| KEEP *
+| SORT id
+;
+
+id:keyword
+1
+2
+3
+;
+
+sameResultAsReadingTheCollectionDirectly
+required_capability: fn_nested_object
+required_capability: fn_nested
+
+FROM nested_orders
+| EVAL o = NESTED_OBJECT(items)
+| EVAL viaReference = NESTED(SUM(o.qty))
+| EVAL direct = NESTED(SUM(items.qty))
+| WHERE viaReference IS NULL AND direct IS NULL OR viaReference == direct
+| KEEP id, viaReference, direct
+| SORT id
+;
+
+id:keyword | viaReference:long | direct:long
+1          | 3                 | 3
+2          | null              | null
+3          | 5                 | 5
+;

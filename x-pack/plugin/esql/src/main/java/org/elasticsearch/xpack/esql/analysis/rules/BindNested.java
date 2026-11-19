@@ -57,8 +57,9 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
                 throw error(nested, "NESTED requires all nodes to support nested reductions");
             }
             List<Attribute> schema = privateSchema(plan.children(), childrenOutput);
+            var dereference = NestedReference.dereferencer(plan.children().isEmpty() ? null : plan.children().getFirst());
             return nested.transformUp(UnresolvedAttribute.class, attribute -> {
-                Attribute field = nestedField(attribute, schema);
+                Attribute field = nestedField(dereference.apply(attribute), schema);
                 return field == null ? attribute : field;
             });
         });
@@ -72,12 +73,7 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
                     throw error(nested, "NESTED does not allow inner scopes or full-text functions");
                 }
             });
-            plan.forEachExpressionDown(NamedExpression.class, expression -> {
-                if (expression.synthetic() == false
-                    && (expression.name().startsWith(NestedScopeField.PREFIX) || expression.name().equals(NestedScopeField.NAMESPACE))) {
-                    throw error(expression, "NESTED uses reserved internal schema names");
-                }
-            });
+            checkNoReservedNames(plan);
         }
         return plan.transformUp(p -> {
             NestedStats nested = find(p);
@@ -92,6 +88,15 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
             }
             LogicalPlan input = p.children().getFirst();
             return p.transformExpressionsOnlyUp(NestedStats.class, stats -> bind(stats, input));
+        });
+    }
+
+    static void checkNoReservedNames(LogicalPlan plan) {
+        plan.forEachExpressionDown(NamedExpression.class, expression -> {
+            if (expression.synthetic() == false
+                && (expression.name().startsWith(NestedScopeField.PREFIX) || expression.name().equals(NestedScopeField.NAMESPACE))) {
+                throw error(expression, "NESTED uses reserved internal schema names");
+            }
         });
     }
 
@@ -119,7 +124,7 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
         if (body.anyMatch(e -> e instanceof NestedStats || e instanceof FullTextFunction)) {
             throw error(nested, "NESTED does not allow inner scopes or full-text functions");
         }
-        checkReadsIndexRows(input, nested);
+        checkReadsIndexRows(input, nested, "NESTED");
         if (body instanceof Sum || body instanceof Count || body instanceof Min || body instanceof Max || body instanceof Avg) {
             // The reductions this slice evaluates.
         } else if (body.anyMatch(AggregateFunction.class::isInstance)) {
@@ -242,7 +247,7 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
      * The nested fields the rows read from the index can offer. A projection drops them from the visible output, but the
      * rows still come from the index, so the source relation's nested fields are in scope too.
      */
-    private static List<Attribute> privateSchema(List<LogicalPlan> children, List<Attribute> visible) {
+    static List<Attribute> privateSchema(List<LogicalPlan> children, List<Attribute> visible) {
         EsRelation relation = children.isEmpty() ? null : sourceRelation(children.getFirst());
         if (relation == null) {
             return visible;
@@ -268,7 +273,7 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
         return plan instanceof EsRelation relation ? relation : null;
     }
 
-    private static Attribute nestedField(UnresolvedAttribute attribute, List<Attribute> output) {
+    static Attribute nestedField(UnresolvedAttribute attribute, List<Attribute> output) {
         String scopedName = NestedScopeField.PREFIX + attribute.name();
         for (Attribute candidate : output) {
             if (candidate instanceof FieldAttribute field && field.name().equals(scopedName) && field.field() instanceof NestedScopeField) {
@@ -310,17 +315,17 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
         return new FieldAttribute(attribute.source(), NestedScopeField.NAMESPACE, null, scopedName, scope, true);
     }
 
-    private static void checkReadsIndexRows(LogicalPlan input, Expression at) {
+    static void checkReadsIndexRows(LogicalPlan input, Expression at, String function) {
         LogicalPlan plan = input;
         while (plan instanceof EsRelation == false && plan.children().isEmpty() == false) {
             if (plan instanceof Aggregate) {
-                throw error(at, "NESTED reads each row's nested documents, so it cannot follow [" + plan.sourceText() + "]");
+                throw error(at, function + " reads each row's nested documents, so it cannot follow [" + plan.sourceText() + "]");
             }
             plan = plan instanceof Join join ? join.left() : plan.children().getFirst();
         }
     }
 
-    private static boolean lookupSourced(LogicalPlan plan, NameId id) {
+    static boolean lookupSourced(LogicalPlan plan, NameId id) {
         if (plan instanceof LookupJoin join) {
             if (containsAttribute(join.right(), id)) {
                 return true;
@@ -354,11 +359,11 @@ public final class BindNested extends Rule<LogicalPlan, LogicalPlan> {
         return false;
     }
 
-    private static String publicName(FieldAttribute field) {
+    static String publicName(FieldAttribute field) {
         return field.name().substring(NestedScopeField.PREFIX.length());
     }
 
-    private static VerificationException error(Expression expression, String message) {
+    static VerificationException error(Expression expression, String message) {
         return new VerificationException(List.of(Failure.fail(expression, message)));
     }
 }
